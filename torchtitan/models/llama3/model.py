@@ -8,6 +8,7 @@
 
 
 from dataclasses import dataclass
+from typing import Optional
 
 import torch
 import torch.nn.functional as F
@@ -17,6 +18,8 @@ from torchtitan.components.tokenizer import Tokenizer
 from torchtitan.config_manager import JobConfig
 from torchtitan.models.attention import build_attention, init_attention_mask
 from torchtitan.protocols.train_spec import BaseModelArgs, ModelProtocol
+
+from fla.layers import GatedDeltaNet
 
 
 @dataclass
@@ -172,96 +175,6 @@ def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
     )
 
 
-class Attention(nn.Module):
-    """
-    Multi-head attention module.
-
-    Args:
-        model_args (TransformerModelArgs): Model configuration arguments.
-
-    Attributes:
-        n_kv_heads (int): Number of key and value heads.
-        n_heads (int): Number of query heads.
-        n_rep (int): Number of repetitions for local heads.
-        head_dim (int): Dimension size of each attention head.
-        wq (Linear): Linear transformation for queries.
-        wk (Linear): Linear transformation for keys.
-        wv (Linear): Linear transformation for values.
-        wo (Linear): Linear transformation for output.
-
-    """
-
-    def __init__(self, model_args: TransformerModelArgs):
-        super().__init__()
-        self.n_heads = model_args.n_heads
-        self.n_kv_heads = (
-            model_args.n_heads
-            if model_args.n_kv_heads is None
-            else model_args.n_kv_heads
-        )
-        self.n_rep = self.n_heads // self.n_kv_heads
-        self.head_dim = model_args.dim // model_args.n_heads
-
-        self.wq = nn.Linear(
-            model_args.dim, model_args.n_heads * self.head_dim, bias=False
-        )
-        self.wk = nn.Linear(model_args.dim, self.n_kv_heads * self.head_dim, bias=False)
-        self.wv = nn.Linear(model_args.dim, self.n_kv_heads * self.head_dim, bias=False)
-        self.wo = nn.Linear(
-            model_args.n_heads * self.head_dim, model_args.dim, bias=False
-        )
-        self.sdpa = build_attention(model_args.use_flex_attn, model_args.attn_mask_type)
-
-    def init_weights(self, init_std: float):
-        for linear in (self.wq, self.wk, self.wv):
-            nn.init.trunc_normal_(linear.weight, mean=0.0, std=0.02)
-        nn.init.trunc_normal_(self.wo.weight, mean=0.0, std=init_std)
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        freqs_cis: torch.Tensor,
-    ):
-        """
-        Forward pass of the attention module.
-
-        Args:
-            x (torch.Tensor): Input tensor.
-            freqs_cis (torch.Tensor): Precomputed frequency tensor.
-
-        Returns:
-            torch.Tensor: Output tensor after attention.
-
-        """
-
-        bs, seqlen, _ = x.shape
-        xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
-
-        # Use -1 instead of `n_heads` (or `n_kv_heads`) to infer the actual
-        # local heads from sizes of xq, xk, and xv as TP may have sharded them
-        # after the above linear ops.
-        xq = xq.view(bs, seqlen, -1, self.head_dim)
-        xk = xk.view(bs, seqlen, -1, self.head_dim)
-        xv = xv.view(bs, seqlen, -1, self.head_dim)
-
-        xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
-
-        # repeat k/v heads if n_kv_heads < n_heads
-        keys = repeat_kv(xk, self.n_rep)  # (bs, seqlen, n_local_heads, head_dim)
-        values = repeat_kv(xv, self.n_rep)  # (bs, seqlen, n_local_heads, head_dim)
-
-        xq = xq.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
-        xk = keys.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
-        xv = values.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
-
-        output = self.sdpa(xq, xk, xv)
-
-        output = output.transpose(
-            1, 2
-        ).contiguous()  # (bs, seqlen, n_local_heads, head_dim)
-        output = output.view(bs, seqlen, -1)
-        return self.wo(output)
-
 
 class FeedForward(nn.Module):
     """
@@ -329,16 +242,30 @@ class TransformerBlock(nn.Module):
 
     def __init__(self, layer_id: int, model_args: TransformerModelArgs):
         super().__init__()
-        self.n_heads = model_args.n_heads
         self.dim = model_args.dim
-        self.attention = Attention(model_args)
-        self.feed_forward = FeedForward(
+        self.ffn_dim_multiplier = model_args.ffn_dim_multiplier
+        self.norm_eps = model_args.norm_eps
+
+        # 替换为 GatedDeltaNet
+        self.gated_delta = GatedDeltaNet(
+            hidden_size=model_args.dim,
+            num_heads=model_args.n_heads,
+            head_dim=model_args.dim // model_args.n_heads,  # 确保 head_dim * num_heads = dim
+            mode='chunk',  # 根据需求选择模式
+            use_gate=True,
+            use_short_conv=True,
+            conv_size=4,
+            norm_eps=model_args.norm_eps,
+            layer_idx=layer_id
+        )
+
+        self.ffn = FeedForward(
             dim=model_args.dim,
             hidden_dim=4 * model_args.dim,
             multiple_of=model_args.multiple_of,
-            ffn_dim_multiplier=model_args.ffn_dim_multiplier,
+            ffn_dim_multiplier=model_args.ffn_dim_multiplier
         )
-        self.attention_norm = nn.RMSNorm(model_args.dim, eps=model_args.norm_eps)
+        # 移除原 attention_norm，GatedDeltaNet 内部已处理归一化
         self.ffn_norm = nn.RMSNorm(model_args.dim, eps=model_args.norm_eps)
 
         if model_args.depth_init:
@@ -347,31 +274,32 @@ class TransformerBlock(nn.Module):
             self.weight_init_std = 0.02 / (2 * model_args.n_layers) ** 0.5
 
     def forward(
-        self,
-        x: torch.Tensor,
-        freqs_cis: torch.Tensor,
+            self,
+            x: torch.Tensor,
+            freqs_cis: torch.Tensor,  # 保留位置编码（若 GatedDeltaNet 不需要可移除）
+            attention_mask: Optional[torch.Tensor] = None,  # 添加必要参数
+            past_key_values: Optional[dict] = None,
+            use_cache: bool = False
     ):
-        """
-        Perform a forward pass through the TransformerBlock.
+        # 若需要旋转位置编码，需先将其融入输入（假设 x 已包含位置编码）
+        # 直接调用 GatedDeltaNet，注意参数匹配
+        h, _, new_past = self.gated_delta(
+            hidden_states=x,
+            attention_mask=attention_mask,
+            past_key_values=past_key_values,
+            use_cache=use_cache
+        )
+        h = x + h  # 残差连接
 
-        Args:
-            x (torch.Tensor): Input tensor.
-            freqs_cis (torch.Tensor): Precomputed cosine and sine frequencies.
-
-        Returns:
-            torch.Tensor: Output tensor after applying attention and feedforward layers.
-
-        """
-        h = x + self.attention(self.attention_norm(x), freqs_cis)
-        out = h + self.feed_forward(self.ffn_norm(h))
-        return out
+        # 前馈网络部分保持不变
+        ffn_out = self.ffn(self.ffn_norm(h))
+        out = h + ffn_out
+        return out, new_past  # 若需要缓存返回状态
 
     def init_weights(self):
-        for norm in (self.attention_norm, self.ffn_norm):
-            norm.reset_parameters()
-        self.attention.init_weights(self.weight_init_std)
-        self.feed_forward.init_weights(self.weight_init_std)
-
+        # GatedDeltaNet 内部已初始化参数，只需初始化前馈网络
+        self.ffn.init_weights(self.weight_init_std)
+        self.ffn_norm.reset_parameters()
 
 class Transformer(nn.Module, ModelProtocol):
     """
@@ -463,31 +391,32 @@ class Transformer(nn.Module, ModelProtocol):
             self.model_args.rope_theta,
         )
 
-    def forward(self, tokens: torch.Tensor):
-        """
-        Perform a forward pass through the Transformer model.
+    def forward(self, tokens: torch.Tensor, use_cache: bool = False):
+        # 生成注意力掩码（若需要）
+        attention_mask = None
+        if self.model_args.attn_mask_type == "causal":
+            seq_len = tokens.shape[1]
+            attention_mask = torch.triu(
+                torch.full((seq_len, seq_len), -float('inf'), device=tokens.device),
+                diagonal=1
+            )
 
-        Args:
-            tokens (torch.Tensor): Input token indices.
+        h = self.tok_embeddings(tokens)
+        past_key_values = {}  # 用于缓存状态
 
-        Returns:
-            torch.Tensor: Output logits after applying the Transformer model.
+        for layer_id, layer in self.layers.items():
+            h, new_past = layer(
+                h,
+                attention_mask=attention_mask,
+                past_key_values=past_key_values.get(layer_id, None),
+                use_cache=use_cache
+            )
+            if use_cache:
+                past_key_values[layer_id] = new_past  # 缓存状态
 
-        """
-        # TODO: We will to change forward() signature to allow tokens to
-        # be always passed in.
-        if self.model_args.use_flex_attn:
-            init_attention_mask(tokens, eos_id=self.eos_id)
-
-        # passthrough for nonexistent layers, allows easy configuration of pipeline parallel stages
-        h = self.tok_embeddings(tokens) if self.tok_embeddings else tokens
-
-        for layer in self.layers.values():
-            h = layer(h, self.freqs_cis)
-
-        h = self.norm(h) if self.norm else h
-        output = self.output(h) if self.output else h
-        return output
+        h = self.norm(h)
+        output = self.output(h)
+        return output, past_key_values  # 返回缓存用于生成
 
     @classmethod
     def from_model_args(cls, model_args: TransformerModelArgs) -> "Transformer":
