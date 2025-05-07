@@ -376,7 +376,7 @@ class TransformerBlock(nn.Module):
             torch.Tensor: Output tensor after applying attention and feedforward layers.
 
         """
-        attn_out, _, _ = self.attention(self.attention_norm(x), freqs_cis)
+        attn_out, _, _ = self.attention(self.attention_norm(x))
         h = x + attn_out
         out = h + self.feed_forward(self.ffn_norm(h))
         return out
