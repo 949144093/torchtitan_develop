@@ -335,7 +335,7 @@ class TransformerBlock(nn.Module):
         # self.attention = Attention(model_args)
         self.attention = GatedDeltaNet(
             hidden_size=model_args.dim,
-            expand_v=model_args.ffn_dim_multiplier or 2.0,
+            expand_v=2,
             head_dim=model_args.dim // model_args.n_heads,
             num_heads=model_args.n_heads,
             mode="chunk",  # or "fused_recurrent" for short sequences
