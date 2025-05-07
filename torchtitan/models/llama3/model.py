@@ -178,8 +178,7 @@ class TransformerBlock(nn.Module):
 
     def forward(
         self,
-        x: torch.Tensor,
-        freqs_cis: torch.Tensor,
+        x: torch.Tensor
     ):
         """
         Perform a forward pass through the TransformerBlock.
