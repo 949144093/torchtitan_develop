@@ -447,9 +447,9 @@ class Transformer(nn.Module, ModelProtocol):
         ``init_weights``. We only call it in the constructor of this
         ``Transformer`` root module to avoid reinitializing tensors.
         """
-        buffer_device = buffer_device or self.freqs_cis.device
-        with torch.device(buffer_device):
-            self.freqs_cis = self._precompute_freqs_cis()
+        # buffer_device = buffer_device or self.freqs_cis.device
+        # with torch.device(buffer_device):
+        #     self.freqs_cis = self._precompute_freqs_cis()
         if self.tok_embeddings is not None:
             nn.init.normal_(self.tok_embeddings.weight)
         for layer in self.layers.values():
@@ -505,7 +505,7 @@ class Transformer(nn.Module, ModelProtocol):
         h = self.tok_embeddings(tokens) if self.tok_embeddings else tokens
 
         for layer in self.layers.values():
-            h = layer(h, self.freqs_cis)
+            h = layer(h)
 
         h = self.norm(h) if self.norm else h
         output = self.output(h) if self.output else h
