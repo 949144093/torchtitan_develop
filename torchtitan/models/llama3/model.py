@@ -8,7 +8,6 @@
 
 
 from dataclasses import dataclass
-from typing import Optional
 
 import torch
 import torch.nn.functional as F
@@ -20,7 +19,6 @@ from torchtitan.models.attention import build_attention, init_attention_mask
 from torchtitan.protocols.train_spec import BaseModelArgs, ModelProtocol
 
 from fla.layers import GatedDeltaNet
-
 
 @dataclass
 class TransformerModelArgs(BaseModelArgs):
@@ -83,97 +81,6 @@ class TransformerModelArgs(BaseModelArgs):
         num_flops_per_token = 6 * (nparams - nparams_embedding) + 12 * l * h * q * t
 
         return nparams, num_flops_per_token
-
-
-def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0) -> torch.Tensor:
-    """
-    Precompute the frequency tensor for complex exponentials (cis) with given dimensions.
-
-    This function calculates a frequency tensor with complex exponentials using the given dimension 'dim'
-    and the end index 'end'. The 'theta' parameter scales the frequencies.
-    The returned tensor contains complex values in complex64 data type.
-
-    Args:
-        dim (int): Dimension of the frequency tensor.
-        end (int): End index for precomputing frequencies.
-        theta (float | None): Scaling factor for frequency computation. Defaults to 10000.0.
-
-    Returns:
-        torch.Tensor: Precomputed frequency tensor with complex exponentials.
-    """
-    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
-    t = torch.arange(end, device=freqs.device)
-    freqs = torch.outer(t, freqs).float()
-    freqs_cis = torch.polar(torch.ones_like(freqs), freqs)  # complex64
-    return freqs_cis
-
-
-def reshape_for_broadcast(freqs_cis: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
-    """
-    Reshape frequency tensor for broadcasting it with another tensor.
-
-    This function reshapes the frequency tensor to have the same shape as the target tensor 'x'
-    for the purpose of broadcasting the frequency tensor during element-wise operations.
-
-    The input freqs_cis tensor is assumed to be of shape (max_seqlen, dim),
-    and the first seqlen elements will be sliced, but dim must match x.
-
-    Args:
-        freqs_cis (torch.Tensor): Frequency tensor to be reshaped.
-        x (torch.Tensor): Target tensor for broadcasting compatibility.
-
-    Returns:
-        torch.Tensor: Reshaped frequency tensor.
-    """
-    ndim = x.ndim
-    assert ndim > 1
-    seqlen = x.shape[1]
-    freqs_cis = freqs_cis[0:seqlen]
-    assert freqs_cis.shape == (seqlen, x.shape[-1])
-    shape = [d if i == 1 or i == ndim - 1 else 1 for i, d in enumerate(x.shape)]
-    return freqs_cis.view(*shape)
-
-
-def apply_rotary_emb(
-    xq: torch.Tensor,
-    xk: torch.Tensor,
-    freqs_cis: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """
-    Apply rotary embeddings to input tensors using the given frequency tensor.
-
-    This function applies rotary embeddings to the given query 'xq' and key 'xk' tensors using the provided
-    frequency tensor 'freqs_cis'. The input tensors are reshaped as complex numbers, and the frequency tensor
-    is reshaped for broadcasting compatibility. The resulting tensors contain rotary embeddings and are
-    returned as real tensors.
-
-    Args:
-        xq (torch.Tensor): Query tensor to apply rotary embeddings.
-        xk (torch.Tensor): Key tensor to apply rotary embeddings.
-        freqs_cis (torch.Tensor): Precomputed frequency tensor for complex exponentials.
-
-    Returns:
-        tuple[torch.Tensor, torch.Tensor]: Tuple of modified query tensor and key tensor with rotary embeddings.
-    """
-    xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
-    xk_ = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
-    freqs_cis = reshape_for_broadcast(freqs_cis, xq_)
-    xq_out = torch.view_as_real(xq_ * freqs_cis).flatten(3)
-    xk_out = torch.view_as_real(xk_ * freqs_cis).flatten(3)
-    return xq_out.type_as(xq), xk_out.type_as(xk)
-
-
-def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
-    """torch.repeat_interleave(x, dim=2, repeats=n_rep)"""
-    bs, slen, n_kv_heads, head_dim = x.shape
-    if n_rep == 1:
-        return x
-    return (
-        torch.unsqueeze(x, dim=3)
-        .expand(bs, slen, n_kv_heads, n_rep, head_dim)
-        .reshape(bs, slen, n_kv_heads * n_rep, head_dim)
-    )
-
 
 
 class FeedForward(nn.Module):
@@ -242,30 +149,26 @@ class TransformerBlock(nn.Module):
 
     def __init__(self, layer_id: int, model_args: TransformerModelArgs):
         super().__init__()
+        self.n_heads = model_args.n_heads
         self.dim = model_args.dim
-        self.ffn_dim_multiplier = model_args.ffn_dim_multiplier
-        self.norm_eps = model_args.norm_eps
-
-        # 替换为 GatedDeltaNet
-        self.gated_delta = GatedDeltaNet(
+        self.attention = GatedDeltaNet(
             hidden_size=model_args.dim,
+            expand_v=2.0,  # 保持默认值或根据需求调整
+            head_dim=model_args.dim // model_args.n_heads,
             num_heads=model_args.n_heads,
-            head_dim=model_args.dim // model_args.n_heads,  # 确保 head_dim * num_heads = dim
-            mode='chunk',  # 根据需求选择模式
+            mode='chunk',  # 或'fused_recurrent'
             use_gate=True,
             use_short_conv=True,
-            conv_size=4,
             norm_eps=model_args.norm_eps,
             layer_idx=layer_id
         )
-
-        self.ffn = FeedForward(
+        self.feed_forward = FeedForward(
             dim=model_args.dim,
             hidden_dim=4 * model_args.dim,
             multiple_of=model_args.multiple_of,
-            ffn_dim_multiplier=model_args.ffn_dim_multiplier
+            ffn_dim_multiplier=model_args.ffn_dim_multiplier,
         )
-        # 移除原 attention_norm，GatedDeltaNet 内部已处理归一化
+        self.attention_norm = nn.RMSNorm(model_args.dim, eps=model_args.norm_eps)
         self.ffn_norm = nn.RMSNorm(model_args.dim, eps=model_args.norm_eps)
 
         if model_args.depth_init:
@@ -274,32 +177,31 @@ class TransformerBlock(nn.Module):
             self.weight_init_std = 0.02 / (2 * model_args.n_layers) ** 0.5
 
     def forward(
-            self,
-            x: torch.Tensor,
-            freqs_cis: torch.Tensor,  # 保留位置编码（若 GatedDeltaNet 不需要可移除）
-            attention_mask: Optional[torch.Tensor] = None,  # 添加必要参数
-            past_key_values: Optional[dict] = None,
-            use_cache: bool = False
+        self,
+        x: torch.Tensor,
+        freqs_cis: torch.Tensor,
     ):
-        # 若需要旋转位置编码，需先将其融入输入（假设 x 已包含位置编码）
-        # 直接调用 GatedDeltaNet，注意参数匹配
-        h, _, new_past = self.gated_delta(
-            hidden_states=x,
-            attention_mask=attention_mask,
-            past_key_values=past_key_values,
-            use_cache=use_cache
-        )
-        h = x + h  # 残差连接
+        """
+        Perform a forward pass through the TransformerBlock.
 
-        # 前馈网络部分保持不变
-        ffn_out = self.ffn(self.ffn_norm(h))
-        out = h + ffn_out
-        return out, new_past  # 若需要缓存返回状态
+        Args:
+            x (torch.Tensor): Input tensor.
+            freqs_cis (torch.Tensor): Precomputed cosine and sine frequencies.
+
+        Returns:
+            torch.Tensor: Output tensor after applying attention and feedforward layers.
+
+        """
+        h = x + self.attention(self.attention_norm(x))
+        out = h + self.feed_forward(self.ffn_norm(h))
+        return out
 
     def init_weights(self):
-        # GatedDeltaNet 内部已初始化参数，只需初始化前馈网络
-        self.ffn.init_weights(self.weight_init_std)
-        self.ffn_norm.reset_parameters()
+        for norm in (self.attention_norm, self.ffn_norm):
+            norm.reset_parameters()
+        self.attention.init_weights(self.weight_init_std)
+        self.feed_forward.init_weights(self.weight_init_std)
+
 
 class Transformer(nn.Module, ModelProtocol):
     """
@@ -336,7 +238,7 @@ class Transformer(nn.Module, ModelProtocol):
         # a seed checkpoint rather than calling init_weights, we need freqs_cis to be
         # initialized by the checkpoint, or we need to add a separate initializer for
         # just the non-persistent buffers that is called after loading checkpoints.
-        self.register_buffer("freqs_cis", self._precompute_freqs_cis(), persistent=True)
+        # self.register_buffer("freqs_cis", self._precompute_freqs_cis(), persistent=True)
 
         self.layers = torch.nn.ModuleDict()
         for layer_id in range(model_args.n_layers):
@@ -391,32 +293,38 @@ class Transformer(nn.Module, ModelProtocol):
             self.model_args.rope_theta,
         )
 
-    def forward(self, tokens: torch.Tensor, use_cache: bool = False):
-        # 生成注意力掩码（若需要）
-        attention_mask = None
-        if self.model_args.attn_mask_type == "causal":
-            seq_len = tokens.shape[1]
-            attention_mask = torch.triu(
-                torch.full((seq_len, seq_len), -float('inf'), device=tokens.device),
-                diagonal=1
+    def forward(self, tokens: torch.Tensor, input_batch: torch.Tensor | None = None):
+        """
+        Perform a forward pass through the Transformer model.
+
+        Args:
+            tokens (torch.Tensor): Input token indices if pipeline parallelism is not enabled.
+                If pipeline parallelism is enabled, this will be the input token indices
+                for the ranks on the first pipeline stage. This will be the activation of the
+                previous pipeline stage if the current rank is not on the first stage.
+            input_batch (torch.Tensor): The input batch read from the dataloader.
+                This will always be the input batch regardless of the pipeline stage.
+                This field is required for non-first PP stages to perform document
+                masking attention (to analyze the boundary of the document).
+
+        Returns:
+            torch.Tensor: Output logits after applying the Transformer model.
+
+        """
+        if self.model_args.use_flex_attn:
+            init_attention_mask(
+                input_batch if input_batch is not None else tokens, eos_id=self.eos_id
             )
 
-        h = self.tok_embeddings(tokens)
-        past_key_values = {}  # 用于缓存状态
+        # passthrough for nonexistent layers, allows easy configuration of pipeline parallel stages
+        h = self.tok_embeddings(tokens) if self.tok_embeddings else tokens
 
-        for layer_id, layer in self.layers.items():
-            h, new_past = layer(
-                h,
-                attention_mask=attention_mask,
-                past_key_values=past_key_values.get(layer_id, None),
-                use_cache=use_cache
-            )
-            if use_cache:
-                past_key_values[layer_id] = new_past  # 缓存状态
+        for layer in self.layers.values():
+            h = layer(h)
 
-        h = self.norm(h)
-        output = self.output(h)
-        return output, past_key_values  # 返回缓存用于生成
+        h = self.norm(h) if self.norm else h
+        output = self.output(h) if self.output else h
+        return output
 
     @classmethod
     def from_model_args(cls, model_args: TransformerModelArgs) -> "Transformer":
