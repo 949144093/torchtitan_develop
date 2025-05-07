@@ -199,7 +199,7 @@ class TransformerBlock(nn.Module):
     def init_weights(self):
         for norm in (self.attention_norm, self.ffn_norm):
             norm.reset_parameters()
-        self.attention.init_weights(self.weight_init_std)
+        # self.attention.init_weights(self.weight_init_std)
         self.feed_forward.init_weights(self.weight_init_std)
 
 
