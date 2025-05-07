@@ -12,7 +12,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn.functional as F
 from torch import nn
-from fla.layers import GatedDeltaNet
+
 from torchtitan.components.tokenizer import Tokenizer
 from torchtitan.config_manager import JobConfig
 from torchtitan.models.attention import build_attention, init_attention_mask
@@ -23,21 +23,22 @@ from torchtitan.protocols.train_spec import BaseModelArgs, ModelProtocol
 class TransformerModelArgs(BaseModelArgs):
     dim: int = 4096
     n_layers: int = 32
-    n_heads: int = 32  # 对应GatedDeltaNet的num_heads
-    head_dim: int = 128  # 手动设置head_dim，需满足n_heads*head_dim=key_dim（GatedDeltaNet中key_dim=num_heads*head_dim）
-    expand_v: float = 2.0  # GatedDeltaNet的value扩张系数
+    n_heads: int = 32
+    n_kv_heads: int | None = None
     vocab_size: int = -1  # defined later by tokenizer
-    multiple_of: int = 256
+    multiple_of: int = 256  # make SwiGLU hidden layer size multiple of large power of 2
     ffn_dim_multiplier: float | None = None
     norm_eps: float = 1e-5
     rope_theta: float = 10000
-    max_seq_len: int = 2048
-    depth_init: bool = True
-    use_gate: bool = True  # GatedDeltaNet的输出门
-    use_short_conv: bool = True  # 短卷积模块
-    conv_size: int = 4  # 短卷积核大小
-    mode: str = 'chunk'  # GatedDeltaNet运行模式
 
+    max_seq_len: int = 2048
+    # If `True`, then each transformer block init uses its layer ID, and if
+    # `False`, each uses the total number of transformer blocks
+    depth_init: bool = True
+
+    use_flex_attn: bool = False
+    attn_mask_type: str = "causal"
+    eos_id: int = 0
 
     def update_from_config(self, job_config: JobConfig, tokenizer: Tokenizer) -> None:
         self.vocab_size = tokenizer.n_words
@@ -307,68 +308,90 @@ class FeedForward(nn.Module):
 
 
 class TransformerBlock(nn.Module):
+    """
+    TransformerBlock Module
+
+    Args:
+        layer_id (int): Identifier for the layer.
+        model_args (TransformerModelArgs): Model configuration arguments.
+
+    Attributes:
+        n_heads (int): Number of attention heads.
+        dim (int): Dimension size of the model.
+        head_dim (int): Dimension size of each attention head.
+        attention (Attention): Attention module.
+        feed_forward (FeedForward): FeedForward module.
+        layer_id (int): Identifier for the layer.
+        attention_norm (RMSNorm): Layer normalization for attention output.
+        ffn_norm (RMSNorm): Layer normalization for feedforward output.
+
+    """
+
     def __init__(self, layer_id: int, model_args: TransformerModelArgs):
         super().__init__()
+        self.n_heads = model_args.n_heads
         self.dim = model_args.dim
-        self.ffn_dim_multiplier = model_args.ffn_dim_multiplier
-        self.multiple_of = model_args.multiple_of
-        self.norm_eps = model_args.norm_eps
-
-        # 替换为GatedDeltaNet
-        self.gated_delta = GatedDeltaNet(
-            hidden_size=model_args.dim,
-            head_dim=model_args.head_dim,
-            num_heads=model_args.n_heads,
-            expand_v=model_args.expand_v,
-            mode=model_args.mode,
-            use_gate=model_args.use_gate,
-            use_short_conv=model_args.use_short_conv,
-            conv_size=model_args.conv_size,
-            norm_eps=model_args.norm_eps,
-            layer_idx=layer_id
+        self.attention = Attention(model_args)
+        self.feed_forward = FeedForward(
+            dim=model_args.dim,
+            hidden_dim=4 * model_args.dim,
+            multiple_of=model_args.multiple_of,
+            ffn_dim_multiplier=model_args.ffn_dim_multiplier,
         )
-
-        self.ffn = self._build_feed_forward()
-        self.norm1 = nn.RMSNorm(model_args.dim, eps=model_args.norm_eps)
-        self.norm2 = nn.RMSNorm(model_args.dim, eps=model_args.norm_eps)
+        self.attention_norm = nn.RMSNorm(model_args.dim, eps=model_args.norm_eps)
+        self.ffn_norm = nn.RMSNorm(model_args.dim, eps=model_args.norm_eps)
 
         if model_args.depth_init:
             self.weight_init_std = 0.02 / (2 * (layer_id + 1)) ** 0.5
         else:
             self.weight_init_std = 0.02 / (2 * model_args.n_layers) ** 0.5
 
-    def _build_feed_forward(self):
-        hidden_dim = 4 * self.dim
-        if self.ffn_dim_multiplier is not None:
-            hidden_dim = int(self.ffn_dim_multiplier * hidden_dim)
-        hidden_dim = self.multiple_of * ((hidden_dim + self.multiple_of - 1) // self.multiple_of)
-        return nn.Sequential(
-            nn.Linear(self.dim, hidden_dim, bias=False),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, self.dim, bias=False)
-        )
+    def forward(
+        self,
+        x: torch.Tensor,
+        freqs_cis: torch.Tensor,
+    ):
+        """
+        Perform a forward pass through the TransformerBlock.
 
-    def forward(self, x: torch.Tensor, attention_mask=None):
-        # GatedDeltaNet输入需要调整维度：(batch, seq_len, hidden_size)
-        residual = x
-        x = self.norm1(x)
+        Args:
+            x (torch.Tensor): Input tensor.
+            freqs_cis (torch.Tensor): Precomputed cosine and sine frequencies.
 
-        # 调用GatedDeltaNet
-        out, _, _ = self.gated_delta(
-            hidden_states=x,
-            attention_mask=attention_mask,
-            use_cache=False,
-            output_attentions=False
-        )
+        Returns:
+            torch.Tensor: Output tensor after applying attention and feedforward layers.
 
-        x = residual + out
-        residual = x
-        x = self.norm2(x)
-        x = self.ffn(x) + residual
-        return x
+        """
+        h = x + self.attention(self.attention_norm(x), freqs_cis)
+        out = h + self.feed_forward(self.ffn_norm(h))
+        return out
+
+    def init_weights(self):
+        for norm in (self.attention_norm, self.ffn_norm):
+            norm.reset_parameters()
+        self.attention.init_weights(self.weight_init_std)
+        self.feed_forward.init_weights(self.weight_init_std)
 
 
 class Transformer(nn.Module, ModelProtocol):
+    """
+    Transformer Module
+
+    Args:
+        model_args (TransformerModelArgs): Model configuration arguments.
+
+    Attributes:
+        model_args (TransformerModelArgs): Model configuration arguments.
+        vocab_size (int): Vocabulary size.
+        n_layers (int): Number of layers in the model.
+        tok_embeddings (ParallelEmbedding): Token embeddings.
+        layers (torch.nn.ModuleList): List of Transformer blocks.
+        norm (RMSNorm): Layer normalization for the model output.
+        output (ColumnParallelLinear): Linear layer for final output.
+        freqs_cis (torch.Tensor): Precomputed cosine and sine frequencies.
+
+    """
+
     def __init__(self, model_args: TransformerModelArgs):
         super().__init__()
         self.model_args = model_args
@@ -377,41 +400,112 @@ class Transformer(nn.Module, ModelProtocol):
         self.eos_id = model_args.eos_id
 
         self.tok_embeddings = nn.Embedding(model_args.vocab_size, model_args.dim)
-        self.layers = nn.ModuleList()
 
+        # TODO persistent should be set to false, since this buffer can be recomputed.
+        # however, we set it to true for 2 reasons.  (1) due to pytorch/pytorch#123411,
+        # compile or pipeline-tracer will not correctly handle non-persistent buffers,
+        # so we need to fix that.  (2) if we initialize pipeline-parallel models from
+        # a seed checkpoint rather than calling init_weights, we need freqs_cis to be
+        # initialized by the checkpoint, or we need to add a separate initializer for
+        # just the non-persistent buffers that is called after loading checkpoints.
+        self.register_buffer("freqs_cis", self._precompute_freqs_cis(), persistent=True)
+
+        self.layers = torch.nn.ModuleDict()
         for layer_id in range(model_args.n_layers):
-            self.layers.append(
-                TransformerBlock(layer_id, model_args)
-            )
-
+            self.layers[str(layer_id)] = TransformerBlock(layer_id, model_args)
         self.norm = nn.RMSNorm(model_args.dim, eps=model_args.norm_eps)
         self.output = nn.Linear(model_args.dim, model_args.vocab_size, bias=False)
         self.init_weights()
 
-    def init_weights(self):
-        nn.init.normal_(self.tok_embeddings.weight)
-        for layer in self.layers:
-            layer.init_weights()
-        nn.init.trunc_normal_(
-            self.output.weight,
-            mean=0.0,
-            std=(self.model_args.dim ** -0.5),
-            a=-3 * (self.model_args.dim ** -0.5),
-            b=3 * (self.model_args.dim ** -0.5),
+    def init_weights(
+        self,
+        buffer_device: torch.device | None = None,
+    ):
+        """
+        [Note: On ``init_weights`` vs. ``reset_parameters``]
+        Modules may define ``reset_parameters`` to initialize parameter values.
+        ``reset_parameters`` is meant to only initialize directly owned
+        parameters/buffers, not those of their child modules, and it can be
+        used to give the initial values for these tensors.
+        Separately, users may want custom initialization for their modules,
+        different from that in ``reset_parameters``. For this, we define
+        ``init_weights``. We only call it in the constructor of this
+        ``Transformer`` root module to avoid reinitializing tensors.
+        """
+        buffer_device = buffer_device or self.freqs_cis.device
+        with torch.device(buffer_device):
+            self.freqs_cis = self._precompute_freqs_cis()
+        if self.tok_embeddings is not None:
+            nn.init.normal_(self.tok_embeddings.weight)
+        for layer in self.layers.values():
+            if layer is not None:
+                layer.init_weights()
+        if self.norm is not None:
+            self.norm.reset_parameters()
+        final_out_std = self.model_args.dim**-0.5
+        cutoff_factor = 3
+        if self.output is not None:
+            nn.init.trunc_normal_(
+                self.output.weight,
+                mean=0.0,
+                std=final_out_std,
+                a=-cutoff_factor * final_out_std,
+                b=cutoff_factor * final_out_std,
+            )
+
+    def _precompute_freqs_cis(self) -> torch.Tensor:
+        return precompute_freqs_cis(
+            self.model_args.dim // self.model_args.n_heads,
+            # Need to compute until at least the max token limit for generation
+            # TODO: explain in docs/composability.md why we removed the 2x
+            # relaxing in our CP enablement PR
+            self.model_args.max_seq_len,
+            self.model_args.rope_theta,
         )
 
-    def forward(self, tokens: torch.Tensor):
-        batch_size, seq_len = tokens.shape
-        attention_mask = torch.zeros((batch_size, seq_len), dtype=torch.bool, device=tokens.device)
-        h = self.tok_embeddings(tokens)
+    def forward(self, tokens: torch.Tensor, input_batch: torch.Tensor | None = None):
+        """
+        Perform a forward pass through the Transformer model.
 
-        for layer in self.layers:
-            h = layer(h, attention_mask=attention_mask)
+        Args:
+            tokens (torch.Tensor): Input token indices if pipeline parallelism is not enabled.
+                If pipeline parallelism is enabled, this will be the input token indices
+                for the ranks on the first pipeline stage. This will be the activation of the
+                previous pipeline stage if the current rank is not on the first stage.
+            input_batch (torch.Tensor): The input batch read from the dataloader.
+                This will always be the input batch regardless of the pipeline stage.
+                This field is required for non-first PP stages to perform document
+                masking attention (to analyze the boundary of the document).
 
-        h = self.norm(h)
-        output = self.output(h)
+        Returns:
+            torch.Tensor: Output logits after applying the Transformer model.
+
+        """
+        if self.model_args.use_flex_attn:
+            init_attention_mask(
+                input_batch if input_batch is not None else tokens, eos_id=self.eos_id
+            )
+
+        # passthrough for nonexistent layers, allows easy configuration of pipeline parallel stages
+        h = self.tok_embeddings(tokens) if self.tok_embeddings else tokens
+
+        for layer in self.layers.values():
+            h = layer(h, self.freqs_cis)
+
+        h = self.norm(h) if self.norm else h
+        output = self.output(h) if self.output else h
         return output
 
     @classmethod
     def from_model_args(cls, model_args: TransformerModelArgs) -> "Transformer":
+        """
+        Initialize a Transformer model from a TransformerModelArgs object.
+
+        Args:
+            model_args (TransformerModelArgs): Model configuration arguments.
+
+        Returns:
+            Transformer: Transformer model.
+
+        """
         return cls(model_args)
