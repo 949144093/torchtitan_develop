@@ -191,8 +191,15 @@ class TransformerBlock(nn.Module):
             torch.Tensor: Output tensor after applying attention and feedforward layers.
 
         """
-        h = x + self.attention(self.attention_norm(x))
-        out = h + self.feed_forward(self.ffn_norm(h))
+        # 对输入进行层归一化，然后传入注意力模块，禁用缓存
+        attn_input = self.attention_norm(x)
+        # 关键：显式设置 use_cache=False，避免 GatedDeltaNet 尝试更新 past_key_values
+        attn_output, _, _ = self.attention(attn_input, use_cache=False)  # 忽略缓存相关输出
+
+        h = x + attn_output  # 残差连接
+        ffn_input = self.ffn_norm(h)
+        ffn_output = self.feed_forward(ffn_input)
+        out = h + ffn_output  # 残差连接
         return out
 
     def init_weights(self):
