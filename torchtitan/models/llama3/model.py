@@ -18,7 +18,6 @@ from torchtitan.config_manager import JobConfig
 from torchtitan.models.attention import build_attention, init_attention_mask
 from torchtitan.protocols.train_spec import BaseModelArgs, ModelProtocol
 
-from fla.layers import GatedDeltaNet
 
 @dataclass
 class TransformerModelArgs(BaseModelArgs):
@@ -213,10 +212,10 @@ class Attention(nn.Module):
         )
         self.sdpa = build_attention(model_args.use_flex_attn, model_args.attn_mask_type)
 
-    # def init_weights(self, init_std: float):
-    #     for linear in (self.wq, self.wk, self.wv):
-    #         nn.init.trunc_normal_(linear.weight, mean=0.0, std=0.02)
-    #     nn.init.trunc_normal_(self.wo.weight, mean=0.0, std=init_std)
+    def init_weights(self, init_std: float):
+        for linear in (self.wq, self.wk, self.wv):
+            nn.init.trunc_normal_(linear.weight, mean=0.0, std=0.02)
+        nn.init.trunc_normal_(self.wo.weight, mean=0.0, std=init_std)
 
     def forward(
         self,
@@ -245,7 +244,7 @@ class Attention(nn.Module):
         xk = xk.view(bs, seqlen, -1, self.head_dim)
         xv = xv.view(bs, seqlen, -1, self.head_dim)
 
-        # xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
+        xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
 
         # repeat k/v heads if n_kv_heads < n_heads
         keys = repeat_kv(xk, self.n_rep)  # (bs, seqlen, n_local_heads, head_dim)
@@ -332,15 +331,7 @@ class TransformerBlock(nn.Module):
         super().__init__()
         self.n_heads = model_args.n_heads
         self.dim = model_args.dim
-        # self.attention = Attention(model_args)
-        self.attention = GatedDeltaNet(
-            hidden_size=model_args.dim,
-            num_heads=model_args.n_heads,
-            num_kv_heads=model_args.n_kv_heads,
-            expand_k=0.75,
-            expand_v=1.5,
-            use_mamba_gate=True
-        )
+        self.attention = Attention(model_args)
         self.feed_forward = FeedForward(
             dim=model_args.dim,
             hidden_dim=4 * model_args.dim,
@@ -371,15 +362,14 @@ class TransformerBlock(nn.Module):
             torch.Tensor: Output tensor after applying attention and feedforward layers.
 
         """
-        # h = x + self.attention(self.attention_norm(x), freqs_cis)
-        h = x + self.attention(self.attention_norm(x))
+        h = x + self.attention(self.attention_norm(x), freqs_cis)
         out = h + self.feed_forward(self.ffn_norm(h))
         return out
 
     def init_weights(self):
         for norm in (self.attention_norm, self.ffn_norm):
             norm.reset_parameters()
-        # self.attention.init_weights(self.weight_init_std)
+        self.attention.init_weights(self.weight_init_std)
         self.feed_forward.init_weights(self.weight_init_std)
 
 
@@ -418,7 +408,7 @@ class Transformer(nn.Module, ModelProtocol):
         # a seed checkpoint rather than calling init_weights, we need freqs_cis to be
         # initialized by the checkpoint, or we need to add a separate initializer for
         # just the non-persistent buffers that is called after loading checkpoints.
-        # self.register_buffer("freqs_cis", self._precompute_freqs_cis(), persistent=True)
+        self.register_buffer("freqs_cis", self._precompute_freqs_cis(), persistent=True)
 
         self.layers = torch.nn.ModuleDict()
         for layer_id in range(model_args.n_layers):
@@ -442,16 +432,14 @@ class Transformer(nn.Module, ModelProtocol):
         ``init_weights``. We only call it in the constructor of this
         ``Transformer`` root module to avoid reinitializing tensors.
         """
-        # buffer_device = buffer_device or :`.device
-        # with torch.device(buffer_device):
-        #     self.freqs_cis = self._precompute_freqs_cis()
+        buffer_device = buffer_device or self.freqs_cis.device
+        with torch.device(buffer_device):
+            self.freqs_cis = self._precompute_freqs_cis()
         if self.tok_embeddings is not None:
             nn.init.normal_(self.tok_embeddings.weight)
         for layer in self.layers.values():
-            layer.attention.apply(self._init_attention_weights)
-        # for layer in self.layers.values():
-        #     if layer is not None:
-        #         layer.init_weights()
+            if layer is not None:
+                layer.init_weights()
         if self.norm is not None:
             self.norm.reset_parameters()
         final_out_std = self.model_args.dim**-0.5
@@ -464,9 +452,6 @@ class Transformer(nn.Module, ModelProtocol):
                 a=-cutoff_factor * final_out_std,
                 b=cutoff_factor * final_out_std,
             )
-
-    def _init_attention_weights(self, module):
-        nn.init.xavier_normal_(module.weight)
 
     def _precompute_freqs_cis(self) -> torch.Tensor:
         return precompute_freqs_cis(
@@ -497,9 +482,8 @@ class Transformer(nn.Module, ModelProtocol):
         # passthrough for nonexistent layers, allows easy configuration of pipeline parallel stages
         h = self.tok_embeddings(tokens) if self.tok_embeddings else tokens
 
-        # for layer in self.layers.values():
-            # h = layer(h, self.freqs_cis)
-            # h = layer(h)
+        for layer in self.layers.values():
+            h = layer(h, self.freqs_cis)
 
         h = self.norm(h) if self.norm else h
         output = self.output(h) if self.output else h
