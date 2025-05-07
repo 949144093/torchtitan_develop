@@ -133,9 +133,9 @@ def reshape_for_broadcast(freqs_cis: torch.Tensor, x: torch.Tensor) -> torch.Ten
 
 
 def apply_rotary_emb(
-        xq: torch.Tensor,
-        xk: torch.Tensor,
-        freqs_cis: torch.Tensor,
+    xq: torch.Tensor,
+    xk: torch.Tensor,
+    freqs_cis: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Apply rotary embeddings to input tensors using the given frequency tensor.
@@ -219,9 +219,9 @@ class Attention(nn.Module):
         nn.init.trunc_normal_(self.wo.weight, mean=0.0, std=init_std)
 
     def forward(
-            self,
-            x: torch.Tensor,
-            freqs_cis: torch.Tensor,
+        self,
+        x: torch.Tensor,
+        freqs_cis: torch.Tensor,
     ):
         """
         Forward pass of the attention module.
@@ -282,11 +282,11 @@ class FeedForward(nn.Module):
     """
 
     def __init__(
-            self,
-            dim: int,
-            hidden_dim: int,
-            multiple_of: int,
-            ffn_dim_multiplier: float | None,
+        self,
+        dim: int,
+        hidden_dim: int,
+        multiple_of: int,
+        ffn_dim_multiplier: float | None,
     ):
         super().__init__()
         hidden_dim = int(2 * hidden_dim / 3)
@@ -361,9 +361,9 @@ class TransformerBlock(nn.Module):
             self.weight_init_std = 0.02 / (2 * model_args.n_layers) ** 0.5
 
     def forward(
-            self,
-            x: torch.Tensor,
-            freqs_cis: torch.Tensor,
+        self,
+        x: torch.Tensor,
+        freqs_cis: torch.Tensor,
     ):
         """
         Perform a forward pass through the TransformerBlock.
@@ -420,7 +420,7 @@ class Transformer(nn.Module, ModelProtocol):
         # however, we set it to true for 2 reasons.  (1) due to pytorch/pytorch#123411,
         # compile or pipeline-tracer will not correctly handle non-persistent buffers,
         # so we need to fix that.  (2) if we initialize pipeline-parallel models from
-        # a seed checkpoint rather than calling init_weights, we need freqs_cis to be
+        # a seed checkpoint rather than calling init_weights, wfe need freqs_cis to be
         # initialized by the checkpoint, or we need to add a separate initializer for
         # just the non-persistent buffers that is called after loading checkpoints.
         self.register_buffer("freqs_cis", self._precompute_freqs_cis(), persistent=True)
@@ -433,8 +433,8 @@ class Transformer(nn.Module, ModelProtocol):
         self.init_weights()
 
     def init_weights(
-            self,
-            buffer_device: torch.device | None = None,
+        self,
+        buffer_device: torch.device | None = None,
     ):
         """
         [Note: On ``init_weights`` vs. ``reset_parameters``]
@@ -457,7 +457,7 @@ class Transformer(nn.Module, ModelProtocol):
                 layer.init_weights()
         if self.norm is not None:
             self.norm.reset_parameters()
-        final_out_std = self.model_args.dim ** -0.5
+        final_out_std = self.model_args.dim**-0.5
         cutoff_factor = 3
         if self.output is not None:
             nn.init.trunc_normal_(
