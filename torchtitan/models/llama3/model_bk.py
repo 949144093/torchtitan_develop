@@ -17,6 +17,7 @@ from torchtitan.components.tokenizer import Tokenizer
 from torchtitan.config_manager import JobConfig
 from torchtitan.models.attention import build_attention, init_attention_mask
 from torchtitan.protocols.train_spec import BaseModelArgs, ModelProtocol
+from fla.layers import GatedDeltaNet
 
 
 @dataclass
@@ -331,7 +332,20 @@ class TransformerBlock(nn.Module):
         super().__init__()
         self.n_heads = model_args.n_heads
         self.dim = model_args.dim
-        self.attention = Attention(model_args)
+        # self.attention = Attention(model_args)
+        self.attention = GatedDeltaNet(
+            hidden_size=model_args.dim,
+            expand_v=2,
+            head_dim=model_args.dim // model_args.n_heads,
+            num_heads=model_args.n_heads,
+            mode="chunk",  # or "fused_recurrent" for short sequences
+            use_gate=True,
+            use_short_conv=True,
+            conv_size=4,
+            conv_bias=False,
+            layer_idx=layer_id,
+            norm_eps=model_args.norm_eps
+        )
         self.feed_forward = FeedForward(
             dim=model_args.dim,
             hidden_dim=4 * model_args.dim,
@@ -348,8 +362,7 @@ class TransformerBlock(nn.Module):
 
     def forward(
         self,
-        x: torch.Tensor,
-        freqs_cis: torch.Tensor,
+        x: torch.Tensor
     ):
         """
         Perform a forward pass through the TransformerBlock.
@@ -362,14 +375,15 @@ class TransformerBlock(nn.Module):
             torch.Tensor: Output tensor after applying attention and feedforward layers.
 
         """
-        h = x + self.attention(self.attention_norm(x), freqs_cis)
+        attn_out, _, _ = self.attention(self.attention_norm(x))
+        h = x + attn_out
         out = h + self.feed_forward(self.ffn_norm(h))
         return out
 
     def init_weights(self):
         for norm in (self.attention_norm, self.ffn_norm):
             norm.reset_parameters()
-        self.attention.init_weights(self.weight_init_std)
+        # self.attention.init_weights(self.weight_init_std)
         self.feed_forward.init_weights(self.weight_init_std)
 
 
@@ -432,9 +446,9 @@ class Transformer(nn.Module, ModelProtocol):
         ``init_weights``. We only call it in the constructor of this
         ``Transformer`` root module to avoid reinitializing tensors.
         """
-        buffer_device = buffer_device or self.freqs_cis.device
-        with torch.device(buffer_device):
-            self.freqs_cis = self._precompute_freqs_cis()
+        # buffer_device = buffer_device or self.freqs_cis.device
+        # with torch.device(buffer_device):
+        #     self.freqs_cis = self._precompute_freqs_cis()
         if self.tok_embeddings is not None:
             nn.init.normal_(self.tok_embeddings.weight)
         for layer in self.layers.values():
@@ -463,27 +477,34 @@ class Transformer(nn.Module, ModelProtocol):
             self.model_args.rope_theta,
         )
 
-    def forward(self, tokens: torch.Tensor):
+    def forward(self, tokens: torch.Tensor, input_batch: torch.Tensor | None = None):
         """
         Perform a forward pass through the Transformer model.
 
         Args:
-            tokens (torch.Tensor): Input token indices.
+            tokens (torch.Tensor): Input token indices if pipeline parallelism is not enabled.
+                If pipeline parallelism is enabled, this will be the input token indices
+                for the ranks on the first pipeline stage. This will be the activation of the
+                previous pipeline stage if the current rank is not on the first stage.
+            input_batch (torch.Tensor): The input batch read from the dataloader.
+                This will always be the input batch regardless of the pipeline stage.
+                This field is required for non-first PP stages to perform document
+                masking attention (to analyze the boundary of the document).
 
         Returns:
             torch.Tensor: Output logits after applying the Transformer model.
 
         """
-        # TODO: We will to change forward() signature to allow tokens to
-        # be always passed in.
         if self.model_args.use_flex_attn:
-            init_attention_mask(tokens, eos_id=self.eos_id)
+            init_attention_mask(
+                input_batch if input_batch is not None else tokens, eos_id=self.eos_id
+            )
 
         # passthrough for nonexistent layers, allows easy configuration of pipeline parallel stages
         h = self.tok_embeddings(tokens) if self.tok_embeddings else tokens
 
         for layer in self.layers.values():
-            h = layer(h, self.freqs_cis)
+            h = layer(h)
 
         h = self.norm(h) if self.norm else h
         output = self.output(h) if self.output else h
