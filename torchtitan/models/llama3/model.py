@@ -201,7 +201,7 @@ class Attention(nn.Module):
             self,
             hidden_states: torch.Tensor,
             freqs_cis: torch.Tensor = None,  # 保留参数但不使用
-            past_key_values: Optional[Cache] = None,
+            past_key_values = None,
             use_cache: bool = False,
             output_attentions: bool = False,
     ):
