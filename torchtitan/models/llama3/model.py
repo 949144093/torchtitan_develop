@@ -18,6 +18,8 @@ from torchtitan.config_manager import JobConfig
 from torchtitan.models.attention import build_attention, init_attention_mask
 from torchtitan.protocols.train_spec import BaseModelArgs, ModelProtocol
 
+from fla.layers import GatedDeltaNet
+
 
 @dataclass
 class TransformerModelArgs(BaseModelArgs):
@@ -174,93 +176,44 @@ def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
 
 class Attention(nn.Module):
     """
-    Multi-head attention module.
-
-    Args:
-        model_args (TransformerModelArgs): Model configuration arguments.
-
-    Attributes:
-        n_kv_heads (int): Number of key and value heads.
-        n_heads (int): Number of query heads.
-        n_rep (int): Number of repetitions for local heads.
-        head_dim (int): Dimension size of each attention head.
-        wq (Linear): Linear transformation for queries.
-        wk (Linear): Linear transformation for keys.
-        wv (Linear): Linear transformation for values.
-        wo (Linear): Linear transformation for output.
-
+    替换为GatedDeltaNet线性Attention模块
     """
 
-    def __init__(self, model_args: TransformerModelArgs):
+    def __init__(self, model_args):
         super().__init__()
-        self.n_heads = model_args.n_heads
-        self.n_kv_heads = (
-            model_args.n_heads
-            if model_args.n_kv_heads is None
-            else model_args.n_kv_heads
-        )
-        self.n_rep = self.n_heads // self.n_kv_heads
-        self.head_dim = model_args.dim // model_args.n_heads
+        self.model_args = model_args
 
-        self.wq = nn.Linear(
-            model_args.dim, model_args.n_heads * self.head_dim, bias=False
+        self.attention = GatedDeltaNet(
+            hidden_size=model_args.dim,
+            expand_v=2.0,
+            head_dim=model_args.dim // model_args.n_heads,
+            num_heads=model_args.n_heads,
+            mode='chunk',
+            use_gate=True,
+            use_short_conv=True,
+            conv_size=4,
+            conv_bias=False,
+            layer_idx=None,
+            norm_eps=1e-5,
         )
-        self.wk = nn.Linear(model_args.dim, self.n_kv_heads * self.head_dim, bias=False)
-        self.wv = nn.Linear(model_args.dim, self.n_kv_heads * self.head_dim, bias=False)
-        self.wo = nn.Linear(
-            model_args.n_heads * self.head_dim, model_args.dim, bias=False
-        )
-        self.sdpa = build_attention(model_args.use_flex_attn, model_args.attn_mask_type)
-
-    def init_weights(self, init_std: float):
-        for linear in (self.wq, self.wk, self.wv):
-            nn.init.trunc_normal_(linear.weight, mean=0.0, std=0.02)
-        nn.init.trunc_normal_(self.wo.weight, mean=0.0, std=init_std)
 
     def forward(
-        self,
-        x: torch.Tensor,
-        freqs_cis: torch.Tensor,
+            self,
+            hidden_states: torch.Tensor,
+            freqs_cis: torch.Tensor = None,  # 保留参数但不使用
+            past_key_values = None,
+            use_cache: bool = False,
+            output_attentions: bool = False,
     ):
-        """
-        Forward pass of the attention module.
-
-        Args:
-            x (torch.Tensor): Input tensor.
-            freqs_cis (torch.Tensor): Precomputed frequency tensor.
-
-        Returns:
-            torch.Tensor: Output tensor after attention.
-
-        """
-
-        bs, seqlen, _ = x.shape
-        xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
-
-        # Use -1 instead of `n_heads` (or `n_kv_heads`) to infer the actual
-        # local heads from sizes of xq, xk, and xv as TP may have sharded them
-        # after the above linear ops.
-        xq = xq.view(bs, seqlen, -1, self.head_dim)
-        xk = xk.view(bs, seqlen, -1, self.head_dim)
-        xv = xv.view(bs, seqlen, -1, self.head_dim)
-
-        xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
-
-        # repeat k/v heads if n_kv_heads < n_heads
-        keys = repeat_kv(xk, self.n_rep)  # (bs, seqlen, n_local_heads, head_dim)
-        values = repeat_kv(xv, self.n_rep)  # (bs, seqlen, n_local_heads, head_dim)
-
-        xq = xq.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
-        xk = keys.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
-        xv = values.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
-
-        output = self.sdpa(xq, xk, xv)
-
-        output = output.transpose(
-            1, 2
-        ).contiguous()  # (bs, seqlen, n_local_heads, head_dim)
-        output = output.view(bs, seqlen, -1)
-        return self.wo(output)
+        # 直接调用GatedDeltaNet的前向传播
+        output, _, present = self.attention(
+            hidden_states=hidden_states,
+            attention_mask=None,
+            past_key_values=past_key_values,
+            use_cache=use_cache,
+            output_attentions=output_attentions
+        )
+        return output, present  # 返回输出和新的缓存状态
 
 
 class FeedForward(nn.Module):
@@ -331,6 +284,7 @@ class TransformerBlock(nn.Module):
         super().__init__()
         self.n_heads = model_args.n_heads
         self.dim = model_args.dim
+        self.layer_id = layer_id
         self.attention = Attention(model_args)
         self.feed_forward = FeedForward(
             dim=model_args.dim,
@@ -347,29 +301,31 @@ class TransformerBlock(nn.Module):
             self.weight_init_std = 0.02 / (2 * model_args.n_layers) ** 0.5
 
     def forward(
-        self,
-        x: torch.Tensor,
-        freqs_cis: torch.Tensor,
+            self,
+            x: torch.Tensor,
+            freqs_cis: torch.Tensor = None,  # 保留参数但不传递给Attention
     ):
-        """
-        Perform a forward pass through the TransformerBlock.
+        # 前向传播
+        residual = x
+        normed_x = self.attention_norm(x)
 
-        Args:
-            x (torch.Tensor): Input tensor.
-            freqs_cis (torch.Tensor): Precomputed cosine and sine frequencies.
+        # 只传递Attention模块实际需要的参数
+        attn_output, present = self.attention(
+            normed_x
+        )
 
-        Returns:
-            torch.Tensor: Output tensor after applying attention and feedforward layers.
-
-        """
-        h = x + self.attention(self.attention_norm(x), freqs_cis)
-        out = h + self.feed_forward(self.ffn_norm(h))
-        return out
+        # 残差连接和FFN
+        x = residual + attn_output
+        residual = x
+        normed_x = self.ffn_norm(x)
+        ffn_output = self.feed_forward(normed_x)
+        x = residual + ffn_output
+        return x
 
     def init_weights(self):
         for norm in (self.attention_norm, self.ffn_norm):
             norm.reset_parameters()
-        self.attention.init_weights(self.weight_init_std)
+        # self.attention.init_weights(self.weight_init_std)
         self.feed_forward.init_weights(self.weight_init_std)
 
 
