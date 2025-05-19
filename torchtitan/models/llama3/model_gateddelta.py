@@ -18,7 +18,8 @@ from torchtitan.config_manager import JobConfig
 from torchtitan.models.attention import build_attention, init_attention_mask
 from torchtitan.protocols.train_spec import BaseModelArgs, ModelProtocol
 
-from fla.layers import Mamba2
+from fla.layers import GatedDeltaNet
+
 
 @dataclass
 class TransformerModelArgs(BaseModelArgs):
@@ -175,73 +176,44 @@ def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
 
 class Attention(nn.Module):
     """
-    Mamba2序列处理器 - 替代传统多头注意力机制
-
-    Args:
-        model_args (TransformerModelArgs): 模型配置参数
-
-    Attributes:
-        mamba (Mamba2): Mamba2层实例
-        hidden_size (int): 隐藏层维度
-        num_heads (int): 注意力头数
-        head_dim (int): 每个头的维度
+    替换为GatedDeltaNet线性Attention模块
     """
 
-    def __init__(self, model_args: TransformerModelArgs):
+    def __init__(self, model_args):
         super().__init__()
+        self.model_args = model_args
 
-        # 从原始注意力模型继承关键参数
-        self.hidden_size = model_args.dim
-        self.num_heads = model_args.n_heads
-        self.head_dim = self.hidden_size // self.num_heads
-
-        # Mamba2配置参数映射
-        mamba_args = {
-            'num_heads': self.num_heads,
-            'head_dim': self.head_dim,
-            'hidden_size': self.hidden_size,
-            'state_size': model_args.mamba_d_state if hasattr(model_args, 'mamba_d_state') else 128,
-            'expand': model_args.mamba_expand if hasattr(model_args, 'mamba_expand') else 2,
-            'n_groups': model_args.mamba_n_groups if hasattr(model_args, 'mamba_n_groups') else 1,
-            'conv_kernel': model_args.mamba_conv_kernel if hasattr(model_args, 'mamba_conv_kernel') else 4,
-            'hidden_act': model_args.mamba_act if hasattr(model_args, 'mamba_act') else 'silu',
-            'rms_norm': model_args.mamba_rms_norm if hasattr(model_args, 'mamba_rms_norm') else True,
-            'use_bias': model_args.mamba_bias if hasattr(model_args, 'mamba_bias') else True,
-            'norm_eps': model_args.mamba_eps if hasattr(model_args, 'mamba_eps') else 1e-5,
-            'layer_idx': model_args.layer_idx if hasattr(model_args, 'layer_idx') else None
-        }
-
-        # 初始化Mamba2层
-        self.mamba = Mamba2(**mamba_args)
-
-        # 保留原始初始化接口
-        self.init_std = 0.02
-
-    def init_weights(self, init_std: float):
-        """保持与原始注意力模块一致的初始化接口"""
-        self.init_std = init_std
-        # Mamba2通常使用默认初始化，如需自定义可在此添加
+        self.attention = GatedDeltaNet(
+            hidden_size=model_args.dim,
+            expand_v=2.0,
+            head_dim=model_args.dim // model_args.n_heads,
+            num_heads=model_args.n_heads,
+            mode='chunk',
+            use_gate=True,
+            use_short_conv=True,
+            conv_size=4,
+            conv_bias=False,
+            layer_idx=None,
+            norm_eps=1e-5,
+        )
 
     def forward(
             self,
-            x: torch.Tensor,
-            freqs_cis: torch.Tensor = None  # Mamba2不需要旋转位置编码
+            hidden_states: torch.Tensor,
+            freqs_cis: torch.Tensor = None,  # 保留参数但不使用
+            past_key_values = None,
+            use_cache: bool = False,
+            output_attentions: bool = False,
     ):
-        """
-        Mamba2前向传播
-
-        Args:
-            x (torch.Tensor): 输入张量 [batch_size, seq_len, hidden_dim]
-            freqs_cis (torch.Tensor): 旋转位置编码（在此实现中不使用）
-
-        Returns:
-            torch.Tensor: 处理后的输出张量
-        """
-        # 直接使用Mamba2处理序列
-        # 注意：Mamba2的输入格式为[batch_size, seq_len, hidden_dim]，与原始注意力模块一致
-        output = self.mamba(x)
-
-        return output
+        # 直接调用GatedDeltaNet的前向传播
+        output, _, present = self.attention(
+            hidden_states=hidden_states,
+            attention_mask=None,
+            past_key_values=past_key_values,
+            use_cache=use_cache,
+            output_attentions=output_attentions
+        )
+        return output, present  # 返回输出和新的缓存状态
 
 
 class FeedForward(nn.Module):
@@ -312,6 +284,7 @@ class TransformerBlock(nn.Module):
         super().__init__()
         self.n_heads = model_args.n_heads
         self.dim = model_args.dim
+        self.layer_id = layer_id
         self.attention = Attention(model_args)
         self.feed_forward = FeedForward(
             dim=model_args.dim,
@@ -328,29 +301,31 @@ class TransformerBlock(nn.Module):
             self.weight_init_std = 0.02 / (2 * model_args.n_layers) ** 0.5
 
     def forward(
-        self,
-        x: torch.Tensor,
-        freqs_cis: torch.Tensor,
+            self,
+            x: torch.Tensor,
+            freqs_cis: torch.Tensor = None,  # 保留参数但不传递给Attention
     ):
-        """
-        Perform a forward pass through the TransformerBlock.
+        # 前向传播
+        residual = x
+        normed_x = self.attention_norm(x)
 
-        Args:
-            x (torch.Tensor): Input tensor.
-            freqs_cis (torch.Tensor): Precomputed cosine and sine frequencies.
+        # 只传递Attention模块实际需要的参数
+        attn_output, present = self.attention(
+            normed_x
+        )
 
-        Returns:
-            torch.Tensor: Output tensor after applying attention and feedforward layers.
-
-        """
-        h = x + self.attention(self.attention_norm(x), freqs_cis)
-        out = h + self.feed_forward(self.ffn_norm(h))
-        return out
+        # 残差连接和FFN
+        x = residual + attn_output
+        residual = x
+        normed_x = self.ffn_norm(x)
+        ffn_output = self.feed_forward(normed_x)
+        x = residual + ffn_output
+        return x
 
     def init_weights(self):
         for norm in (self.attention_norm, self.ffn_norm):
             norm.reset_parameters()
-        self.attention.init_weights(self.weight_init_std)
+        # self.attention.init_weights(self.weight_init_std)
         self.feed_forward.init_weights(self.weight_init_std)
 
 
