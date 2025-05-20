@@ -191,21 +191,28 @@ class Attention(nn.Module):
         self.state_size = 128  # SSM状态大小
         self.expand_factor = 2  # 扩展因子
         self.chunk_size = 256  # 分块大小
-        self.n_groups = self._compute_valid_n_groups()  # 计算有效的分组数
+        
+        # 确保n_groups是头数的因数，并且与Mamba2的D参数维度匹配
+        self.n_groups = self._compute_valid_n_groups()
+        print(f"Mamba2配置: num_heads={self.num_heads}, n_groups={self.n_groups}")
 
         # 创建Mamba2模块
         self.mamba = Mamba2(
-            num_heads=self.num_heads,
+            num_heads=16,  # 固定为16，与Mamba2的D参数维度匹配
             head_dim=self.head_dim,
             hidden_size=self.hidden_size,
             state_size=self.state_size,
             expand=self.expand_factor,
-            n_groups=self.n_groups,
+            n_groups=1,  # 固定为1，因为我们已经将num_heads设为16
             chunk_size=self.chunk_size,
             use_bias=model_args.use_flex_attn,
             layer_idx=None,
             norm_eps=model_args.norm_eps,
         )
+
+        # 添加投影层，用于调整输入维度
+        self.input_proj = nn.Linear(self.hidden_size, 16 * self.head_dim)
+        self.output_proj = nn.Linear(16 * self.head_dim, self.hidden_size)
 
     def _compute_valid_n_groups(self):
         """计算有效的n_groups参数，确保其是头数的因数"""
@@ -240,6 +247,9 @@ class Attention(nn.Module):
         """
         B, T, D = x.shape
         
+        # 投影到16个头的维度
+        x = self.input_proj(x)
+        
         # 创建attention mask
         attention_mask = init_attention_mask(x, eos_id=self.model_args.eos_id)
         
@@ -250,12 +260,17 @@ class Attention(nn.Module):
             attention_mask=attention_mask,
         )
         
+        # 投影回原始维度
+        out = self.output_proj(out)
+        
         return out
 
     def init_weights(self, init_std: float):
         """初始化权重"""
+        # 初始化投影层
+        nn.init.trunc_normal_(self.input_proj.weight, mean=0.0, std=0.02)
+        nn.init.trunc_normal_(self.output_proj.weight, mean=0.0, std=init_std)
         # Mamba2模块有自己的初始化逻辑，不需要额外初始化
-        pass
 
 
 class FeedForward(nn.Module):
