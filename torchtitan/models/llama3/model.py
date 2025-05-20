@@ -17,6 +17,7 @@ from torchtitan.components.tokenizer import Tokenizer
 from torchtitan.config_manager import JobConfig
 from torchtitan.models.attention import build_attention, init_attention_mask
 from torchtitan.protocols.train_spec import BaseModelArgs, ModelProtocol
+
 from fla.layers import Mamba2
 
 @dataclass
@@ -174,94 +175,64 @@ def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
 
 class Attention(nn.Module):
     """
-    使用Mamba2替换原有的attention机制
-    
+    使用Mamba2替换原始的多头注意力模块。
+
     Args:
-        model_args (TransformerModelArgs): 模型配置参数
+        model_args (TransformerModelArgs): 模型配置参数。
+        layer_idx (int, optional): 层索引。
+
+    Attributes:
+        mamba2 (Mamba2): Mamba2模型实例。
+        norm (nn.RMSNorm): 层归一化。
+        wo (nn.Linear): 输出线性变换。
+
     """
 
-    def __init__(self, model_args: TransformerModelArgs):
+    def __init__(self, model_args: TransformerModelArgs, layer_idx: int = None):
         super().__init__()
         self.model_args = model_args
-        self.num_heads = model_args.n_heads
-        self.head_dim = model_args.dim // model_args.n_heads
-        self.hidden_size = model_args.dim
 
-        # Mamba2参数配置
-        self.state_size = 128  # SSM状态大小
-        self.expand_factor = 2  # 扩展因子
-        self.chunk_size = 256  # 分块大小
-        
-        # 确保n_groups是头数的因数，并且与Mamba2的D参数维度匹配
-        self.n_groups = self._compute_valid_n_groups()
-        print(f"Mamba2配置: num_heads={self.num_heads}, n_groups={self.n_groups}")
-
-        # 创建Mamba2模块，确保num_heads与D参数维度匹配
-        self.mamba = Mamba2(
-            num_heads=32,  # 保持32个头
-            head_dim=self.head_dim,
-            hidden_size=32 * self.head_dim,  # 32个头的维度
-            state_size=self.state_size,
-            expand=self.expand_factor,
-            n_groups=32,  # 设置为32，使得每个头独立处理
-            chunk_size=self.chunk_size,
-            use_bias=model_args.use_flex_attn,
-            layer_idx=None,
+        # 创建Mamba2实例，映射Llama3的参数到Mamba2
+        self.mamba2 = Mamba2(
+            num_heads=model_args.n_heads,
+            head_dim=model_args.dim // model_args.n_heads,
+            hidden_size=model_args.dim,
+            layer_idx=layer_idx,
             norm_eps=model_args.norm_eps,
+            # 映射其他相关参数
+            rms_norm=True,
+            use_bias=True,
+            hidden_act="silu",
         )
 
-        # 添加投影层，用于调整输入维度
-        self.input_proj = nn.Linear(self.hidden_size, 32 * self.head_dim)
-        self.output_proj = nn.Linear(32 * self.head_dim, self.hidden_size)
+        # Mamba2之后的输出线性变换
+        self.wo = nn.Linear(model_args.dim, model_args.dim, bias=False)
 
-    def _compute_valid_n_groups(self):
-        """计算有效的n_groups参数，确保其是头数的因数"""
-        # 由于Mamba2的D参数维度是32，我们需要确保n_groups的选择能产生正确的头数
-        return 32  # 直接返回32，使得每个头独立处理
+        # 层归一化
+        self.norm = nn.RMSNorm(model_args.dim, eps=model_args.norm_eps)
 
-    def forward(
-        self,
-        x: torch.Tensor,
-        freqs_cis: torch.Tensor = None,  # 保留参数但不使用
-        cache=None,
-    ):
+    def forward(self, x: torch.Tensor, freqs_cis: torch.Tensor = None):
         """
-        前向传播
-        
+        前向传播过程。
+
         Args:
-            x (torch.Tensor): 输入张量，形状为 [batch_size, seq_len, hidden_size]
-            freqs_cis (torch.Tensor, optional): 预计算的频率张量，不使用
-            cache: 缓存参数
-            
-        Returns:
-            torch.Tensor: 输出张量，形状为 [batch_size, seq_len, hidden_size]
-        """
-        B, T, D = x.shape
-        
-        # 投影到32个头的维度，保持3D形状
-        x = self.input_proj(x)  # [B, T, 32 * head_dim]
-        
-        # 创建attention mask
-        attention_mask = init_attention_mask(x, eos_id=self.model_args.eos_id)
-        
-        # 调用Mamba2，确保输入是3D张量
-        out = self.mamba(
-            hidden_states=x,  # [B, T, 32 * head_dim]
-            cache_params=cache,
-            attention_mask=attention_mask,
-        )
-        
-        # 投影回原始维度
-        out = self.output_proj(out)  # [B, T, hidden_size]
-        
-        return out
+            x (torch.Tensor): 输入张量。
+            freqs_cis (torch.Tensor, optional): 旋转位置编码。在Mamba2中不使用，但为了保持接口一致保留。
 
-    def init_weights(self, init_std: float):
-        """初始化权重"""
-        # 初始化投影层
-        nn.init.trunc_normal_(self.input_proj.weight, mean=0.0, std=0.02)
-        nn.init.trunc_normal_(self.output_proj.weight, mean=0.0, std=init_std)
-        # Mamba2模块有自己的初始化逻辑，不需要额外初始化
+        Returns:
+            torch.Tensor: 注意力计算后的输出。
+        """
+        # 应用层归一化
+        x_norm = self.norm(x)
+
+        # 使用Mamba2计算注意力
+        # 注意：Mamba2处理长序列的方式与注意力机制不同，不需要显式的KV
+        mamba_output = self.mamba2(x_norm)
+
+        # 应用输出线性变换
+        output = self.wo(mamba_output)
+
+        return output
 
 
 class FeedForward(nn.Module):
@@ -363,7 +334,7 @@ class TransformerBlock(nn.Module):
             torch.Tensor: Output tensor after applying attention and feedforward layers.
 
         """
-        h = x + self.attention(x, freqs_cis)
+        h = x + self.attention(self.attention_norm(x), freqs_cis)
         out = h + self.feed_forward(self.ffn_norm(h))
         return out
 
