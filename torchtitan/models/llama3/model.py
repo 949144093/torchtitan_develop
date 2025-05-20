@@ -180,18 +180,19 @@ class Mamba2Attention(nn.Module):
         # 基础参数
         self.hidden_size = model_args.dim
         self.num_heads = model_args.n_heads
-        self.expand = getattr(model_args, 'mamba_expand', 2)  # 扩展因子，默认2
+        self.expand = 2  # 扩展因子，默认2
         self.intermediate_size = self.expand * self.hidden_size  # intermediate_size = expand * hidden_size
         self.head_dim = self.intermediate_size // self.num_heads  # 必须为整数，如 8192//32=256
-        assert self.intermediate_size % self.num_heads == 0, "head_dim must be integer"
+        self.n_groups = model_args.n_heads  # 分组数等于头数，减少显存占用
+        self.state_size = model_args.mamba_d_state if hasattr(model_args, 'mamba_d_state') else 64  # 降低state_size
 
         # Mamba2参数
         mamba_args = {
             'num_heads': self.num_heads,
             'head_dim': self.head_dim,
             'hidden_size': self.hidden_size,
-            'state_size': getattr(model_args, 'mamba_d_state', 128),  # SSM状态维度
-            'n_groups': getattr(model_args, 'mamba_n_groups', 1),     # 分组数，默认1
+            'state_size': self.state_size,
+            'n_groups': self.n_groups,
             'conv_kernel': getattr(model_args, 'mamba_conv_kernel', 4),# 卷积核大小
             'hidden_act': getattr(model_args, 'mamba_act', 'silu'),    # 激活函数
             'use_bias': getattr(model_args, 'mamba_bias', True),      # 是否使用偏置
