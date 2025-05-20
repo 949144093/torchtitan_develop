@@ -200,7 +200,7 @@ class Attention(nn.Module):
         self.mamba = Mamba2(
             num_heads=16,  # 固定为16，与Mamba2的D参数维度匹配
             head_dim=self.head_dim,
-            hidden_size=self.hidden_size,
+            hidden_size=16 * self.head_dim,  # 修改为16个头的维度
             state_size=self.state_size,
             expand=self.expand_factor,
             n_groups=1,  # 固定为1，因为我们已经将num_heads设为16
@@ -238,17 +238,20 @@ class Attention(nn.Module):
         前向传播
         
         Args:
-            x (torch.Tensor): 输入张量
+            x (torch.Tensor): 输入张量，形状为 [batch_size, seq_len, hidden_size]
             freqs_cis (torch.Tensor, optional): 预计算的频率张量，不使用
             cache: 缓存参数
             
         Returns:
-            torch.Tensor: 输出张量
+            torch.Tensor: 输出张量，形状为 [batch_size, seq_len, hidden_size]
         """
         B, T, D = x.shape
         
         # 投影到16个头的维度
-        x = self.input_proj(x)
+        x = self.input_proj(x)  # [B, T, 16 * head_dim]
+        
+        # 重塑张量以匹配Mamba2的期望输入形状
+        x = x.view(B, T, 16, self.head_dim)  # [B, T, 16, head_dim]
         
         # 创建attention mask
         attention_mask = init_attention_mask(x, eos_id=self.model_args.eos_id)
@@ -260,8 +263,11 @@ class Attention(nn.Module):
             attention_mask=attention_mask,
         )
         
+        # 重塑回原始形状
+        out = out.view(B, T, 16 * self.head_dim)  # [B, T, 16 * head_dim]
+        
         # 投影回原始维度
-        out = self.output_proj(out)
+        out = self.output_proj(out)  # [B, T, hidden_size]
         
         return out
 
