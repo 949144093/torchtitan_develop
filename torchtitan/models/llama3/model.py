@@ -250,21 +250,15 @@ class Attention(nn.Module):
         # 投影到16个头的维度
         x = self.input_proj(x)  # [B, T, 16 * head_dim]
         
-        # 重塑张量以匹配Mamba2的期望输入形状
-        x = x.view(B, T, 16, self.head_dim)  # [B, T, 16, head_dim]
-        
         # 创建attention mask
         attention_mask = init_attention_mask(x, eos_id=self.model_args.eos_id)
         
-        # 调用Mamba2
+        # 调用Mamba2，保持输入为3D张量
         out = self.mamba(
-            hidden_states=x,
+            hidden_states=x,  # [B, T, 16 * head_dim]
             cache_params=cache,
             attention_mask=attention_mask,
         )
-        
-        # 重塑回原始形状
-        out = out.view(B, T, 16 * self.head_dim)  # [B, T, 16 * head_dim]
         
         # 投影回原始维度
         out = self.output_proj(out)  # [B, T, hidden_size]
