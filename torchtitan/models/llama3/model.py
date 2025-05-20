@@ -174,78 +174,43 @@ def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
 
 
 class Attention(nn.Module):
-    """
-    Mamba2序列处理器 - 替代传统多头注意力机制
-
-    Args:
-        model_args (TransformerModelArgs): 模型配置参数
-
-    Attributes:
-        mamba (Mamba2): Mamba2层实例
-        hidden_size (int): 隐藏层维度
-        num_heads (int): 注意力头数
-        head_dim (int): 每个头的维度
-    """
-
     def __init__(self, model_args: TransformerModelArgs):
         super().__init__()
-
-        # 从原始注意力模型继承关键参数
-        self.hidden_size = model_args.dim
-        self.num_heads = model_args.n_heads
+        self.hidden_size = model_args.dim  # 模型隐藏维度，如 4096
+        self.num_heads = model_args.n_heads  # 头数，如 32
         self.expand = 2  # Mamba2 默认扩展因子
-        self.intermediate_size = self.expand * self.hidden_size  # 8192
-        self.head_dim = self.intermediate_size // self.num_heads  # 8192 // 32 = 256
 
-        # Mamba2配置参数映射
+        # 计算 intermediate_size 和 head_dim
+        self.intermediate_size = self.expand * self.hidden_size  # 8192
+        # 确保 head_dim 是 Mamba2 期望的维度
+        # 根据 Mamba2 源码，head_dim 是每个头的维度，通常是 64 或 128
+        # 这里假设 hidden_size 是 head_dim 的整数倍
+        self.head_dim = self.hidden_size // self.num_heads  # 4096 // 32 = 128
+
+        # 确保 num_heads 是 n_groups 的整数倍
+        self.n_groups = getattr(model_args, 'mamba_n_groups', 1)
+        assert self.num_heads % self.n_groups == 0, "num_heads must be divisible by n_groups"
+
         mamba_args = {
             'num_heads': self.num_heads,
-            'head_dim': self.head_dim,
-            'hidden_size': self.hidden_size,
-            'intermediate_size': self.intermediate_size,
-            'state_size': model_args.mamba_d_state if hasattr(model_args, 'mamba_d_state') else 128,
-            'expand': self.expand,
-            'n_groups': model_args.mamba_n_groups if hasattr(model_args, 'mamba_n_groups') else 1,
-            'conv_kernel': model_args.mamba_conv_kernel if hasattr(model_args, 'mamba_conv_kernel') else 4,
-            'hidden_act': model_args.mamba_act if hasattr(model_args, 'mamba_act') else 'silu',
-            'rms_norm': model_args.mamba_rms_norm if hasattr(model_args, 'mamba_rms_norm') else True,
-            'use_bias': model_args.mamba_bias if hasattr(model_args, 'mamba_bias') else True,
-            'norm_eps': model_args.mamba_eps if hasattr(model_args, 'mamba_eps') else 1e-5,
-            'layer_idx': model_args.layer_idx if hasattr(model_args, 'layer_idx') else None
+            'head_dim': self.head_dim,  # 128
+            'hidden_size': self.hidden_size,  # 4096
+            'state_size': getattr(model_args, 'mamba_d_state', 128),
+            'expand': self.expand,  # 2
+            'n_groups': self.n_groups,  # 1
+            'conv_kernel': getattr(model_args, 'mamba_conv_kernel', 4),
+            'hidden_act': getattr(model_args, 'mamba_act', 'silu'),
+            'rms_norm': getattr(model_args, 'mamba_rms_norm', True),
+            'use_bias': getattr(model_args, 'mamba_bias', True),
+            'norm_eps': getattr(model_args, 'mamba_eps', 1e-5),
+            'layer_idx': getattr(model_args, 'layer_idx', None),
         }
 
-        # 初始化Mamba2层
         self.mamba = Mamba2(**mamba_args)
-
-        # 保留原始初始化接口
         self.init_std = 0.02
 
-    def init_weights(self, init_std: float):
-        """保持与原始注意力模块一致的初始化接口"""
-        self.init_std = init_std
-        # Mamba2通常使用默认初始化，如需自定义可在此添加
-
-    def forward(
-            self,
-            x: torch.Tensor,
-            freqs_cis: torch.Tensor = None  # Mamba2不需要旋转位置编码
-    ):
-        """
-        Mamba2前向传播
-
-        Args:
-            x (torch.Tensor): 输入张量 [batch_size, seq_len, hidden_dim]
-            freqs_cis (torch.Tensor): 旋转位置编码（在此实现中不使用）
-
-        Returns:
-            torch.Tensor: 处理后的输出张量
-        """
-        # 直接使用Mamba2处理序列
-        # 注意：Mamba2的输入格式为[batch_size, seq_len, hidden_dim]，与原始注意力模块一致
-        output = self.mamba(x)
-
-        return output
-
+    def forward(self, x, freqs_cis=None):
+        return self.mamba(x)
 
 class FeedForward(nn.Module):
     """
