@@ -196,14 +196,14 @@ class Attention(nn.Module):
         self.n_groups = self._compute_valid_n_groups()
         print(f"Mamba2配置: num_heads={self.num_heads}, n_groups={self.n_groups}")
 
-        # 创建Mamba2模块
+        # 创建Mamba2模块，确保num_heads与D参数维度匹配
         self.mamba = Mamba2(
-            num_heads=16,  # 固定为16，与Mamba2的D参数维度匹配
+            num_heads=32,  # 修改为32，与原始头数匹配
             head_dim=self.head_dim,
-            hidden_size=16 * self.head_dim,  # 修改为16个头的维度
+            hidden_size=32 * self.head_dim,  # 修改为32个头的维度
             state_size=self.state_size,
             expand=self.expand_factor,
-            n_groups=1,  # 固定为1，因为我们已经将num_heads设为16
+            n_groups=2,  # 修改为2，使得32/2=16，与Mamba2的D参数维度匹配
             chunk_size=self.chunk_size,
             use_bias=model_args.use_flex_attn,
             layer_idx=None,
@@ -211,8 +211,8 @@ class Attention(nn.Module):
         )
 
         # 添加投影层，用于调整输入维度
-        self.input_proj = nn.Linear(self.hidden_size, 16 * self.head_dim)
-        self.output_proj = nn.Linear(16 * self.head_dim, self.hidden_size)
+        self.input_proj = nn.Linear(self.hidden_size, 32 * self.head_dim)
+        self.output_proj = nn.Linear(32 * self.head_dim, self.hidden_size)
 
     def _compute_valid_n_groups(self):
         """计算有效的n_groups参数，确保其是头数的因数"""
@@ -247,24 +247,18 @@ class Attention(nn.Module):
         """
         B, T, D = x.shape
         
-        # 投影到16个头的维度
-        x = self.input_proj(x)  # [B, T, 16 * head_dim]
-        
-        # 重塑张量以匹配Mamba2的期望输入形状
-        x = x.view(B, T, 16, self.head_dim)  # [B, T, 16, head_dim]
+        # 投影到32个头的维度，保持3D形状
+        x = self.input_proj(x)  # [B, T, 32 * head_dim]
         
         # 创建attention mask
         attention_mask = init_attention_mask(x, eos_id=self.model_args.eos_id)
         
-        # 调用Mamba2
+        # 调用Mamba2，确保输入是3D张量
         out = self.mamba(
-            hidden_states=x,  # [B, T, 16, head_dim]
+            hidden_states=x,  # [B, T, 32 * head_dim]
             cache_params=cache,
             attention_mask=attention_mask,
         )
-        
-        # 重塑回原始形状
-        out = out.view(B, T, 16 * self.head_dim)  # [B, T, 16 * head_dim]
         
         # 投影回原始维度
         out = self.output_proj(out)  # [B, T, hidden_size]
