@@ -173,43 +173,36 @@ def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
     )
 
 
-class Attention(nn.Module):
+class Mamba2Attention(nn.Module):
+    """Mamba2注意力模块，替代传统多头注意力"""
     def __init__(self, model_args: TransformerModelArgs):
         super().__init__()
-        self.hidden_size = model_args.dim  # 模型隐藏维度，如 4096
-        self.num_heads = model_args.n_heads  # 头数，如 32
-        self.expand = 2  # Mamba2 默认扩展因子
+        # 基础参数
+        self.hidden_size = model_args.dim
+        self.num_heads = model_args.n_heads
+        self.expand = getattr(model_args, 'mamba_expand', 2)  # 扩展因子，默认2
+        self.intermediate_size = self.expand * self.hidden_size  # intermediate_size = expand * hidden_size
+        self.head_dim = self.intermediate_size // self.num_heads  # 必须为整数，如 8192//32=256
+        assert self.intermediate_size % self.num_heads == 0, "head_dim must be integer"
 
-        # 计算 intermediate_size 和 head_dim
-        self.intermediate_size = self.expand * self.hidden_size  # 8192
-        # 确保 head_dim 是 Mamba2 期望的维度
-        # 根据 Mamba2 源码，head_dim 是每个头的维度，通常是 64 或 128
-        # 这里假设 hidden_size 是 head_dim 的整数倍
-        self.head_dim = self.hidden_size // self.num_heads  # 4096 // 32 = 128
-
-        # 确保 num_heads 是 n_groups 的整数倍
-        self.n_groups = getattr(model_args, 'mamba_n_groups', 1)
-        assert self.num_heads % self.n_groups == 0, "num_heads must be divisible by n_groups"
-
+        # Mamba2参数
         mamba_args = {
             'num_heads': self.num_heads,
-            'head_dim': self.head_dim,  # 128
-            'hidden_size': self.hidden_size,  # 4096
-            'state_size': getattr(model_args, 'mamba_d_state', 128),
-            'expand': self.expand,  # 2
-            'n_groups': self.n_groups,  # 1
-            'conv_kernel': getattr(model_args, 'mamba_conv_kernel', 4),
-            'hidden_act': getattr(model_args, 'mamba_act', 'silu'),
-            'rms_norm': getattr(model_args, 'mamba_rms_norm', True),
-            'use_bias': getattr(model_args, 'mamba_bias', True),
-            'norm_eps': getattr(model_args, 'mamba_eps', 1e-5),
-            'layer_idx': getattr(model_args, 'layer_idx', None),
+            'head_dim': self.head_dim,
+            'hidden_size': self.hidden_size,
+            'state_size': getattr(model_args, 'mamba_d_state', 128),  # SSM状态维度
+            'n_groups': getattr(model_args, 'mamba_n_groups', 1),     # 分组数，默认1
+            'conv_kernel': getattr(model_args, 'mamba_conv_kernel', 4),# 卷积核大小
+            'hidden_act': getattr(model_args, 'mamba_act', 'silu'),    # 激活函数
+            'use_bias': getattr(model_args, 'mamba_bias', True),      # 是否使用偏置
+            'layer_idx': getattr(model_args, 'layer_idx', None),      # 层索引（可选）
         }
 
         self.mamba = Mamba2(**mamba_args)
-        self.init_std = 0.02
 
-    def forward(self, x, freqs_cis=None):
+    def forward(self, x: torch.Tensor, freqs_cis: torch.Tensor = None):
+        """前向传播"""
+        # Mamba2不需要旋转位置编码，忽略freqs_cis
         return self.mamba(x)
 
 class FeedForward(nn.Module):
