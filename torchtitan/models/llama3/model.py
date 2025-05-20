@@ -283,17 +283,13 @@ class TransformerBlock(nn.Module):
             self,
             x: torch.Tensor,
             freqs_cis: torch.Tensor = None,  # 传递但Mamba2不使用
-            cache_params: Optional[Mamba2Cache] = None,  # 传递给Mamba2的缓存
-            cache_position: Optional[torch.LongTensor] = None,
     ):
         # 残差连接：注意力部分
         h_norm = self.attention_norm(x)
         # 调用Mamba2注意力（传递缓存参数）
         attn_output = self.attention(
             h_norm,
-            freqs_cis=freqs_cis,
-            cache_params=cache_params,
-            cache_position=cache_position,
+            freqs_cis=freqs_cis
         )
         h = x + attn_output  # 残差连接
 
