@@ -198,12 +198,12 @@ class Attention(nn.Module):
 
         # 创建Mamba2模块，确保num_heads与D参数维度匹配
         self.mamba = Mamba2(
-            num_heads=32,  # 修改为32，与原始头数匹配
+            num_heads=32,  # 保持32个头
             head_dim=self.head_dim,
-            hidden_size=32 * self.head_dim,  # 修改为32个头的维度
+            hidden_size=32 * self.head_dim,  # 32个头的维度
             state_size=self.state_size,
             expand=self.expand_factor,
-            n_groups=2,  # 修改为2，使得32/2=16，与Mamba2的D参数维度匹配
+            n_groups=32,  # 设置为32，使得每个头独立处理
             chunk_size=self.chunk_size,
             use_bias=model_args.use_flex_attn,
             layer_idx=None,
@@ -216,17 +216,8 @@ class Attention(nn.Module):
 
     def _compute_valid_n_groups(self):
         """计算有效的n_groups参数，确保其是头数的因数"""
-        # 由于Mamba2的D参数维度是16，我们需要确保n_groups的选择能产生正确的头数
-        target_heads = 16  # Mamba2的D参数维度
-        if self.num_heads % target_heads == 0:
-            return target_heads
-        elif self.num_heads % 8 == 0:
-            return 8
-        elif self.num_heads % 4 == 0:
-            return 4
-        elif self.num_heads % 2 == 0:
-            return 2
-        return 1
+        # 由于Mamba2的D参数维度是32，我们需要确保n_groups的选择能产生正确的头数
+        return 32  # 直接返回32，使得每个头独立处理
 
     def forward(
         self,
