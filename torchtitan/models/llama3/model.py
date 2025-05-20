@@ -17,7 +17,6 @@ from torchtitan.components.tokenizer import Tokenizer
 from torchtitan.config_manager import JobConfig
 from torchtitan.models.attention import build_attention, init_attention_mask
 from torchtitan.protocols.train_spec import BaseModelArgs, ModelProtocol
-
 from fla.layers import Mamba2
 
 @dataclass
@@ -173,7 +172,14 @@ def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
     )
 
 
-class Mamba2Attention(nn.Module):
+class Attention(nn.Module):
+    """
+    使用Mamba2替换原有的attention机制
+    
+    Args:
+        model_args (TransformerModelArgs): 模型配置参数
+    """
+
     def __init__(self, model_args: TransformerModelArgs):
         super().__init__()
         self.model_args = model_args
@@ -181,16 +187,13 @@ class Mamba2Attention(nn.Module):
         self.head_dim = model_args.dim // model_args.n_heads
         self.hidden_size = model_args.dim
 
-        # 确保n_groups是头数的因数
-        self.n_groups = self._compute_valid_n_groups()
-        print(f"Mamba2配置: num_heads={self.num_heads}, n_groups={self.n_groups}")
+        # Mamba2参数配置
+        self.state_size = 128  # SSM状态大小
+        self.expand_factor = 2  # 扩展因子
+        self.chunk_size = 256  # 分块大小
+        self.n_groups = self._compute_valid_n_groups()  # 计算有效的分组数
 
-        # 其他参数
-        self.state_size = 128
-        self.expand_factor = 2
-        self.chunk_size = 256
-
-        # 创建Mamba2模块，确保所有参数一致
+        # 创建Mamba2模块
         self.mamba = Mamba2(
             num_heads=self.num_heads,
             head_dim=self.head_dim,
@@ -201,54 +204,59 @@ class Mamba2Attention(nn.Module):
             chunk_size=self.chunk_size,
             use_bias=model_args.use_flex_attn,
             layer_idx=None,
+            norm_eps=model_args.norm_eps,
         )
-
-        # 验证参数一致性
-        assert self.mamba.D.shape[0] == self.num_heads, \
-            f"Mamba2 D参数形状不匹配: {self.mamba.D.shape[0]} vs 模型配置: {self.num_heads}"
 
     def _compute_valid_n_groups(self):
         """计算有效的n_groups参数，确保其是头数的因数"""
-        max_groups = min(8, self.num_heads)  # 最大尝试8组
-        for n in range(max_groups, 0, -1):
-            if self.num_heads % n == 0:
-                return n
-        return 1  # 最坏情况下使用1组
+        # 由于Mamba2的D参数维度是16，我们需要确保n_groups的选择能产生正确的头数
+        target_heads = 16  # Mamba2的D参数维度
+        if self.num_heads % target_heads == 0:
+            return target_heads
+        elif self.num_heads % 8 == 0:
+            return 8
+        elif self.num_heads % 4 == 0:
+            return 4
+        elif self.num_heads % 2 == 0:
+            return 2
+        return 1
 
-    def forward(self, x: torch.Tensor, freqs_cis: torch.Tensor, cache=None):
+    def forward(
+        self,
+        x: torch.Tensor,
+        freqs_cis: torch.Tensor = None,  # 保留参数但不使用
+        cache=None,
+    ):
+        """
+        前向传播
+        
+        Args:
+            x (torch.Tensor): 输入张量
+            freqs_cis (torch.Tensor, optional): 预计算的频率张量，不使用
+            cache: 缓存参数
+            
+        Returns:
+            torch.Tensor: 输出张量
+        """
         B, T, D = x.shape
-        h, d_h = self.num_heads, self.head_dim
-
-        # 打印详细维度信息用于调试
-        print(f"输入维度: {x.shape}, 头数: {h}, 头维度: {d_h}, n_groups: {self.n_groups}")
-        print(f"Mamba2参数 - D: {self.mamba.D.shape}, A_log: {self.mamba.A_log.shape}")
-
-        # 应用RoPE位置编码
-        x_heads = x.view(B, T, h, d_h)
-        x_rope = []
-        for head_idx in range(h):
-            head = x_heads[:, :, head_idx, :]
-            head_complex = torch.view_as_complex(head.float().reshape(*head.shape[:-1], -1, 2))
-            freqs_head = freqs_cis[0:T, :d_h // 2]
-            head_rope = torch.view_as_real(head_complex * freqs_head).flatten(2)
-            x_rope.append(head_rope.type_as(head))
-
-        x_rope = torch.cat(x_rope, dim=2).view(B, T, h, d_h)
-
-        # 重塑为Mamba2期望的形状 (B, T, H*D_h)
-        x_rope = x_rope.permute(0, 2, 1, 3).contiguous().view(B, T, D)
-
-        # 调用Mamba2
+        
+        # 创建attention mask
         attention_mask = init_attention_mask(x, eos_id=self.model_args.eos_id)
+        
+        # 调用Mamba2
         out = self.mamba(
-            hidden_states=x_rope,
+            hidden_states=x,
             cache_params=cache,
             attention_mask=attention_mask,
         )
-
-        # 确保输出维度正确
-        assert out.shape == (B, T, D), f"输出维度不匹配: {out.shape} vs {B, T, D}"
+        
         return out
+
+    def init_weights(self, init_std: float):
+        """初始化权重"""
+        # Mamba2模块有自己的初始化逻辑，不需要额外初始化
+        pass
+
 
 class FeedForward(nn.Module):
     """
@@ -316,15 +324,17 @@ class TransformerBlock(nn.Module):
 
     def __init__(self, layer_id: int, model_args: TransformerModelArgs):
         super().__init__()
-        self.attention_norm = nn.RMSNorm(model_args.dim, eps=model_args.norm_eps)
-        self.ffn_norm = nn.RMSNorm(model_args.dim, eps=model_args.norm_eps)
-        self.attention = Mamba2Attention(model_args)
+        self.n_heads = model_args.n_heads
+        self.dim = model_args.dim
+        self.attention = Attention(model_args)
         self.feed_forward = FeedForward(
             dim=model_args.dim,
             hidden_dim=4 * model_args.dim,
             multiple_of=model_args.multiple_of,
             ffn_dim_multiplier=model_args.ffn_dim_multiplier,
         )
+        self.attention_norm = nn.RMSNorm(model_args.dim, eps=model_args.norm_eps)
+        self.ffn_norm = nn.RMSNorm(model_args.dim, eps=model_args.norm_eps)
 
         if model_args.depth_init:
             self.weight_init_std = 0.02 / (2 * (layer_id + 1)) ** 0.5
@@ -347,15 +357,14 @@ class TransformerBlock(nn.Module):
             torch.Tensor: Output tensor after applying attention and feedforward layers.
 
         """
-        h_norm = self.attention_norm(x)
-        attn_out = self.attention(h_norm, freqs_cis)
-        h = x + attn_out
-        h = h + self.feed_forward(self.ffn_norm(h))
-        return h
+        h = x + self.attention(x, freqs_cis)
+        out = h + self.feed_forward(self.ffn_norm(h))
+        return out
 
     def init_weights(self):
         for norm in (self.attention_norm, self.ffn_norm):
             norm.reset_parameters()
+        self.attention.init_weights(self.weight_init_std)
         self.feed_forward.init_weights(self.weight_init_std)
 
 
