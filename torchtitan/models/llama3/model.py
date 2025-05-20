@@ -174,65 +174,38 @@ def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
 
 
 class Attention(nn.Module):
-    """
-    使用Mamba2替换原始的多头注意力模块。
-
-    Args:
-        model_args (TransformerModelArgs): 模型配置参数。
-        layer_idx (int, optional): 层索引。
-
-    Attributes:
-        mamba2 (Mamba2): Mamba2模型实例。
-        norm (nn.RMSNorm): 层归一化。
-        wo (nn.Linear): 输出线性变换。
-
-    """
+    """使用Mamba2替换原始注意力的模块"""
 
     def __init__(self, model_args: TransformerModelArgs, layer_idx: int = None):
         super().__init__()
         self.model_args = model_args
+        head_dim = model_args.dim // model_args.n_heads  # 128 for dim=4096, n_heads=32
 
-        # 创建Mamba2实例，映射Llama3的参数到Mamba2
         self.mamba2 = Mamba2(
-            num_heads=model_args.n_heads,
-            head_dim=model_args.dim // model_args.n_heads,
-            hidden_size=model_args.dim,
+            num_heads=model_args.n_heads,  # 必须等于n_heads（32）
+            head_dim=head_dim,  # 128
+            hidden_size=model_args.dim,  # 4096
             layer_idx=layer_idx,
             norm_eps=model_args.norm_eps,
-            # 映射其他相关参数
-            rms_norm=True,
+            n_groups=1,  # 避免分组导致头数拆分错误
+            state_size=head_dim,  # 适配头维度
+            chunk_size=model_args.max_seq_len,  # 适配最大序列长度
             use_bias=True,
-            hidden_act="silu",
+            rms_norm=True,
         )
 
-        # Mamba2之后的输出线性变换
         self.wo = nn.Linear(model_args.dim, model_args.dim, bias=False)
-
-        # 层归一化
         self.norm = nn.RMSNorm(model_args.dim, eps=model_args.norm_eps)
 
     def forward(self, x: torch.Tensor, freqs_cis: torch.Tensor = None):
         """
-        前向传播过程。
-
         Args:
-            x (torch.Tensor): 输入张量。
-            freqs_cis (torch.Tensor, optional): 旋转位置编码。在Mamba2中不使用，但为了保持接口一致保留。
-
-        Returns:
-            torch.Tensor: 注意力计算后的输出。
+            freqs_cis: 旋转位置编码（Mamba2无需使用，兼容接口）
         """
-        # 应用层归一化
         x_norm = self.norm(x)
-
-        # 使用Mamba2计算注意力
-        # 注意：Mamba2处理长序列的方式与注意力机制不同，不需要显式的KV
-        mamba_output = self.mamba2(x_norm)
-
-        # 应用输出线性变换
-        output = self.wo(mamba_output)
-
-        return output
+        # Mamba2输入维度：(batch, seq_len, hidden_size)
+        mamba_output = self.mamba2(x_norm)  # 内部自动拆分为(num_heads, head_dim)
+        return self.wo(mamba_output)
 
 
 class FeedForward(nn.Module):
