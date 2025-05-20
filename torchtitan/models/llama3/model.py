@@ -273,7 +273,7 @@ class TransformerBlock(nn.Module):
         super().__init__()
         self.n_heads = model_args.n_heads
         self.dim = model_args.dim
-        self.attention = Attention(model_args)
+        self.attention = Mamba2Attention(model_args)
         ff_hidden_dim = 2 * model_args.dim  # 如 8192
         self.feed_forward = FeedForward(
             dim=model_args.dim,
