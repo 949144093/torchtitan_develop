@@ -193,15 +193,18 @@ class Attention(nn.Module):
         # 从原始注意力模型继承关键参数
         self.hidden_size = model_args.dim
         self.num_heads = model_args.n_heads
-        self.head_dim = self.hidden_size // self.num_heads
+        self.expand = 2  # Mamba2 默认扩展因子
+        self.intermediate_size = self.expand * self.hidden_size  # 8192
+        self.head_dim = self.intermediate_size // self.num_heads  # 8192 // 32 = 256
 
         # Mamba2配置参数映射
         mamba_args = {
             'num_heads': self.num_heads,
             'head_dim': self.head_dim,
             'hidden_size': self.hidden_size,
+            'intermediate_size': self.intermediate_size,
             'state_size': model_args.mamba_d_state if hasattr(model_args, 'mamba_d_state') else 128,
-            'expand': model_args.mamba_expand if hasattr(model_args, 'mamba_expand') else 2,
+            'expand': self.expand,
             'n_groups': model_args.mamba_n_groups if hasattr(model_args, 'mamba_n_groups') else 1,
             'conv_kernel': model_args.mamba_conv_kernel if hasattr(model_args, 'mamba_conv_kernel') else 4,
             'hidden_act': model_args.mamba_act if hasattr(model_args, 'mamba_act') else 'silu',
@@ -313,9 +316,10 @@ class TransformerBlock(nn.Module):
         self.n_heads = model_args.n_heads
         self.dim = model_args.dim
         self.attention = Attention(model_args)
+        ff_hidden_dim = 2 * model_args.dim  # 如 8192
         self.feed_forward = FeedForward(
             dim=model_args.dim,
-            hidden_dim=4 * model_args.dim,
+            hidden_dim=ff_hidden_dim,
             multiple_of=model_args.multiple_of,
             ffn_dim_multiplier=model_args.ffn_dim_multiplier,
         )
