@@ -174,37 +174,46 @@ def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
 
 
 class Attention(nn.Module):
-    """使用Mamba2替换原始注意力的模块"""
+    """使用Mamba2的注意力模块"""
 
     def __init__(self, model_args: TransformerModelArgs, layer_idx: int = None):
         super().__init__()
         self.model_args = model_args
-        head_dim = model_args.dim // model_args.n_heads  # 128 for dim=4096, n_heads=32
+        head_dim = model_args.dim // model_args.n_heads  # 128 (4096/32)
 
+        # 初始化Mamba2，映射Llama3参数
         self.mamba2 = Mamba2(
-            num_heads=model_args.n_heads,  # 必须等于n_heads（32）
-            head_dim=head_dim,  # 128
-            hidden_size=model_args.dim,  # 4096
-            layer_idx=layer_idx,
-            norm_eps=model_args.norm_eps,
-            n_groups=1,  # 避免分组导致头数拆分错误
-            state_size=head_dim,  # 适配头维度
+            num_heads=model_args.n_heads,  # 头数与Llama3一致（32）
+            head_dim=head_dim,  # 头维度（128）
+            hidden_size=model_args.dim,  # 隐藏层大小（4096）
+            state_size=head_dim,  # 状态大小与头维度一致
+            expand=2,  # Mamba2默认扩展比例
+            n_groups=1,  # 禁止分组，避免头数拆分
+            conv_kernel=4,  # 默认卷积核大小
+            hidden_act="silu",  # 激活函数与Llama3一致
+            rms_norm=True,  # 使用RMSNorm
+            norm_eps=model_args.norm_eps,  # 归一化参数
+            layer_idx=layer_idx,  # 层索引（可选）
             chunk_size=model_args.max_seq_len,  # 适配最大序列长度
-            use_bias=True,
-            rms_norm=True,
         )
 
+        # Mamba2输出线性层（与Llama3注意力输出一致）
         self.wo = nn.Linear(model_args.dim, model_args.dim, bias=False)
+        # 层归一化（与Llama3结构一致）
         self.norm = nn.RMSNorm(model_args.dim, eps=model_args.norm_eps)
 
-    def forward(self, x: torch.Tensor, freqs_cis: torch.Tensor = None):
-        """
-        Args:
-            freqs_cis: 旋转位置编码（Mamba2无需使用，兼容接口）
-        """
+    def forward(
+            self,
+            x: torch.Tensor,
+            freqs_cis: torch.Tensor = None,  # 保留参数，但Mamba2不使用
+    ):
+        # 应用层归一化
         x_norm = self.norm(x)
-        # Mamba2输入维度：(batch, seq_len, hidden_size)
-        mamba_output = self.mamba2(x_norm)  # 内部自动拆分为(num_heads, head_dim)
+        # 调用Mamba2前向传播（忽略freqs_cis）
+        mamba_output = self.mamba2(
+            x_norm
+        )
+        # 线性变换输出
         return self.wo(mamba_output)
 
 
@@ -253,69 +262,46 @@ class FeedForward(nn.Module):
 
 
 class TransformerBlock(nn.Module):
-    """
-    TransformerBlock Module
-
-    Args:
-        layer_id (int): Identifier for the layer.
-        model_args (TransformerModelArgs): Model configuration arguments.
-
-    Attributes:
-        n_heads (int): Number of attention heads.
-        dim (int): Dimension size of the model.
-        head_dim (int): Dimension size of each attention head.
-        attention (Attention): Attention module.
-        feed_forward (FeedForward): FeedForward module.
-        layer_id (int): Identifier for the layer.
-        attention_norm (RMSNorm): Layer normalization for attention output.
-        ffn_norm (RMSNorm): Layer normalization for feedforward output.
-
-    """
+    """替换为Mamba2的Transformer块"""
 
     def __init__(self, layer_id: int, model_args: TransformerModelArgs):
         super().__init__()
-        self.n_heads = model_args.n_heads
         self.dim = model_args.dim
-        self.attention = Attention(model_args)
+        # 使用Mamba2注意力模块
+        self.attention = Attention(model_args, layer_idx=layer_id)
         self.feed_forward = FeedForward(
             dim=model_args.dim,
             hidden_dim=4 * model_args.dim,
             multiple_of=model_args.multiple_of,
             ffn_dim_multiplier=model_args.ffn_dim_multiplier,
         )
+        # 层归一化（与原始Llama3一致）
         self.attention_norm = nn.RMSNorm(model_args.dim, eps=model_args.norm_eps)
         self.ffn_norm = nn.RMSNorm(model_args.dim, eps=model_args.norm_eps)
 
-        if model_args.depth_init:
-            self.weight_init_std = 0.02 / (2 * (layer_id + 1)) ** 0.5
-        else:
-            self.weight_init_std = 0.02 / (2 * model_args.n_layers) ** 0.5
-
     def forward(
-        self,
-        x: torch.Tensor,
-        freqs_cis: torch.Tensor,
+            self,
+            x: torch.Tensor,
+            freqs_cis: torch.Tensor = None,  # 传递但Mamba2不使用
+            cache_params: Optional[Mamba2Cache] = None,  # 传递给Mamba2的缓存
+            cache_position: Optional[torch.LongTensor] = None,
     ):
-        """
-        Perform a forward pass through the TransformerBlock.
+        # 残差连接：注意力部分
+        h_norm = self.attention_norm(x)
+        # 调用Mamba2注意力（传递缓存参数）
+        attn_output = self.attention(
+            h_norm,
+            freqs_cis=freqs_cis,
+            cache_params=cache_params,
+            cache_position=cache_position,
+        )
+        h = x + attn_output  # 残差连接
 
-        Args:
-            x (torch.Tensor): Input tensor.
-            freqs_cis (torch.Tensor): Precomputed cosine and sine frequencies.
-
-        Returns:
-            torch.Tensor: Output tensor after applying attention and feedforward layers.
-
-        """
-        h = x + self.attention(self.attention_norm(x), freqs_cis)
-        out = h + self.feed_forward(self.ffn_norm(h))
+        # 残差连接：前馈网络部分
+        ffn_normed = self.ffn_norm(h)
+        ffn_output = self.feed_forward(ffn_normed)
+        out = h + ffn_output
         return out
-
-    def init_weights(self):
-        for norm in (self.attention_norm, self.ffn_norm):
-            norm.reset_parameters()
-        # self.attention.init_weights(self.weight_init_std)
-        self.feed_forward.init_weights(self.weight_init_std)
 
 
 class Transformer(nn.Module, ModelProtocol):
