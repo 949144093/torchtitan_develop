@@ -178,13 +178,13 @@ class Mamba2Attention(nn.Module):
         super().__init__()
         self.model_args = model_args
         self.num_heads = model_args.n_heads
-        self.head_dim = model_args.dim // model_args.n_heads  # 从现有参数计算
-        self.hidden_size = model_args.dim  # 直接复用dim参数
+        self.head_dim = model_args.dim // model_args.n_heads
+        self.hidden_size = model_args.dim
 
-        # 硬编码Mamba2默认超参数（不新增模型参数）
-        self.state_size = 128  # 固定状态维度
-        self.expand_factor = 2  # 固定扩展因子
-        self.chunk_size = 256  # 固定分块大小（可根据max_seq_len动态调整）
+        # Mamba2参数（硬编码）
+        self.state_size = 128
+        self.expand_factor = 2
+        self.chunk_size = 256
 
         self.mamba = Mamba2(
             num_heads=self.num_heads,
@@ -193,34 +193,40 @@ class Mamba2Attention(nn.Module):
             state_size=self.state_size,
             expand=self.expand_factor,
             chunk_size=self.chunk_size,
-            use_bias=model_args.use_flex_attn,  # 复用现有布尔参数
+            use_bias=model_args.use_flex_attn,
             layer_idx=None,
         )
 
     def forward(self, x: torch.Tensor, freqs_cis: torch.Tensor, cache=None):
-        # 1. 维度转换：(B, T, D) -> (B, T, H, D_h) -> (B, H, T, D_h)
         B, T, D = x.shape
         h, d_h = self.num_heads, self.head_dim
-        x = x.view(B, T, h, d_h).transpose(1, 2)  # (B, H, T, D_h)
 
-        # 2. 应用RoPE位置编码（与Llama3完全一致）
-        x = x.permute(0, 2, 1, 3).contiguous().view(B, T, h * d_h)
-        x = apply_rotary_emb(x, x, freqs_cis)[0]  # 复用原有RoPE函数
-        x = x.view(B, T, h, d_h).transpose(1, 2).contiguous()  # 恢复为 (B, H, T, D_h)
-        x = x.permute(0, 2, 1, 3).contiguous().view(B, T, D)  # 转回 (B, T, D)
+        # 1. 正确处理维度转换以匹配freqs_cis
+        # 先将输入重塑为多头格式 (B, T, H, D_h)
+        x_heads = x.view(B, T, h, d_h)
 
-        # 3. 准备Mamba2所需输入（注意力掩码和缓存）
+        # 2. 为每个头单独应用RoPE（关键修改点）
+        x_rope = []
+        for head_idx in range(h):
+            head = x_heads[:, :, head_idx, :]  # (B, T, D_h)
+            # 重塑为复数格式并应用RoPE
+            head_complex = torch.view_as_complex(head.float().reshape(*head.shape[:-1], -1, 2))
+            # 确保freqs_cis的维度与当前头匹配
+            freqs_head = freqs_cis[0:T, :d_h // 2]  # 截取前d_h//2个频率
+            freqs_head = reshape_for_broadcast(freqs_head, head_complex)
+            head_rope = torch.view_as_real(head_complex * freqs_head).flatten(2)
+            x_rope.append(head_rope.type_as(head))
+
+        # 3. 重新组合所有头
+        x_rope = torch.cat(x_rope, dim=2)  # (B, T, H*D_h)
+        x_rope = x_rope.view(B, T, h, d_h).permute(0, 2, 1, 3).contiguous().view(B, T, D)
+
+        # 4. 调用Mamba2
         attention_mask = init_attention_mask(x, eos_id=self.model_args.eos_id)
-
-        # 4. 调用FLA的Mamba2模块（使用硬编码默认参数）
         out = self.mamba(
-            hidden_states=x,
+            hidden_states=x_rope,
             cache_params=cache,
             attention_mask=attention_mask,
-            # 以下参数使用硬编码默认值，不依赖ModelArgs
-            state_size=self.state_size,
-            expand=self.expand_factor,
-            chunk_size=self.chunk_size,
         )
         return out
 
