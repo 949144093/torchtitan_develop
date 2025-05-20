@@ -299,6 +299,11 @@ class TransformerBlock(nn.Module):
         out = h + ffn_output
         return out
 
+    def init_weights(self):
+        for norm in (self.attention_norm, self.ffn_norm):
+            norm.reset_parameters()
+        self.feed_forward.init_weights(self.weight_init_std)
+
 
 class Transformer(nn.Module, ModelProtocol):
     """
