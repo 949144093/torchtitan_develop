@@ -181,7 +181,13 @@ class Mamba2Attention(nn.Module):
         self.head_dim = model_args.dim // model_args.n_heads
         self.hidden_size = model_args.dim
 
-        # Mamba2参数（硬编码）
+        # 计算合适的n_groups参数（关键修改点）
+        self.n_groups = min(8, self.num_heads)  # 默认为8或头数的最小值
+        while self.num_heads % self.n_groups != 0:
+            self.n_groups -= 1
+        print(f"Mamba2配置: num_heads={self.num_heads}, n_groups={self.n_groups}")
+
+        # 其他参数
         self.state_size = 128
         self.expand_factor = 2
         self.chunk_size = 256
@@ -192,6 +198,7 @@ class Mamba2Attention(nn.Module):
             hidden_size=self.hidden_size,
             state_size=self.state_size,
             expand=self.expand_factor,
+            n_groups=self.n_groups,  # 传递计算得到的n_groups
             chunk_size=self.chunk_size,
             use_bias=model_args.use_flex_attn,
             layer_idx=None,
@@ -201,33 +208,31 @@ class Mamba2Attention(nn.Module):
         B, T, D = x.shape
         h, d_h = self.num_heads, self.head_dim
 
-        # 1. 正确处理维度转换以匹配freqs_cis
-        # 先将输入重塑为多头格式 (B, T, H, D_h)
+        # 应用RoPE（保持之前的修复）
         x_heads = x.view(B, T, h, d_h)
-
-        # 2. 为每个头单独应用RoPE（关键修改点）
         x_rope = []
         for head_idx in range(h):
-            head = x_heads[:, :, head_idx, :]  # (B, T, D_h)
-            # 重塑为复数格式并应用RoPE
+            head = x_heads[:, :, head_idx, :]
             head_complex = torch.view_as_complex(head.float().reshape(*head.shape[:-1], -1, 2))
-            # 确保freqs_cis的维度与当前头匹配
-            freqs_head = freqs_cis[0:T, :d_h // 2]  # 截取前d_h//2个频率
-            freqs_head = reshape_for_broadcast(freqs_head, head_complex)
+            freqs_head = freqs_cis[0:T, :d_h // 2]
             head_rope = torch.view_as_real(head_complex * freqs_head).flatten(2)
             x_rope.append(head_rope.type_as(head))
 
-        # 3. 重新组合所有头
-        x_rope = torch.cat(x_rope, dim=2)  # (B, T, H*D_h)
-        x_rope = x_rope.view(B, T, h, d_h).permute(0, 2, 1, 3).contiguous().view(B, T, D)
+        x_rope = torch.cat(x_rope, dim=2).view(B, T, h, d_h)
 
-        # 4. 调用Mamba2
+        # 重塑为Mamba2期望的形状 (B, T, H*D_h)
+        x_rope = x_rope.permute(0, 2, 1, 3).contiguous().view(B, T, D)
+
+        # 调用Mamba2
         attention_mask = init_attention_mask(x, eos_id=self.model_args.eos_id)
         out = self.mamba(
             hidden_states=x_rope,
             cache_params=cache,
             attention_mask=attention_mask,
         )
+
+        # 确保输出维度正确
+        assert out.shape == (B, T, D), f"输出维度不匹配: {out.shape} vs {B, T, D}"
         return out
 
 class FeedForward(nn.Module):
