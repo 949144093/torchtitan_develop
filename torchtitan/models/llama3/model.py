@@ -181,10 +181,8 @@ class Mamba2Attention(nn.Module):
         self.head_dim = model_args.dim // model_args.n_heads
         self.hidden_size = model_args.dim
 
-        # 计算合适的n_groups参数（关键修改点）
-        self.n_groups = min(8, self.num_heads)  # 默认为8或头数的最小值
-        while self.num_heads % self.n_groups != 0:
-            self.n_groups -= 1
+        # 确保n_groups是头数的因数
+        self.n_groups = self._compute_valid_n_groups()
         print(f"Mamba2配置: num_heads={self.num_heads}, n_groups={self.n_groups}")
 
         # 其他参数
@@ -192,23 +190,40 @@ class Mamba2Attention(nn.Module):
         self.expand_factor = 2
         self.chunk_size = 256
 
+        # 创建Mamba2模块，确保所有参数一致
         self.mamba = Mamba2(
             num_heads=self.num_heads,
             head_dim=self.head_dim,
             hidden_size=self.hidden_size,
             state_size=self.state_size,
             expand=self.expand_factor,
-            n_groups=self.n_groups,  # 传递计算得到的n_groups
+            n_groups=self.n_groups,
             chunk_size=self.chunk_size,
             use_bias=model_args.use_flex_attn,
             layer_idx=None,
         )
 
+        # 验证参数一致性
+        assert self.mamba.D.shape[0] == self.num_heads, \
+            f"Mamba2 D参数形状不匹配: {self.mamba.D.shape[0]} vs 模型配置: {self.num_heads}"
+
+    def _compute_valid_n_groups(self):
+        """计算有效的n_groups参数，确保其是头数的因数"""
+        max_groups = min(8, self.num_heads)  # 最大尝试8组
+        for n in range(max_groups, 0, -1):
+            if self.num_heads % n == 0:
+                return n
+        return 1  # 最坏情况下使用1组
+
     def forward(self, x: torch.Tensor, freqs_cis: torch.Tensor, cache=None):
         B, T, D = x.shape
         h, d_h = self.num_heads, self.head_dim
 
-        # 应用RoPE（保持之前的修复）
+        # 打印详细维度信息用于调试
+        print(f"输入维度: {x.shape}, 头数: {h}, 头维度: {d_h}, n_groups: {self.n_groups}")
+        print(f"Mamba2参数 - D: {self.mamba.D.shape}, A_log: {self.mamba.A_log.shape}")
+
+        # 应用RoPE位置编码
         x_heads = x.view(B, T, h, d_h)
         x_rope = []
         for head_idx in range(h):
