@@ -205,15 +205,11 @@ class Attention(nn.Module):
             self,
             x: torch.Tensor,
             freqs_cis: torch.Tensor = None,  # 忽略位置编码
-            cache_params = None,
-            cache_position = None,
     ):
         x_norm = self.norm(x)  # (batch, seq_len, 4096)
         # 调用Mamba2，确保输入维度正确
         mamba_output = self.mamba2(
             x_norm,
-            cache_params=cache_params,
-            cache_position=cache_position,
             attention_mask=None,
         )  # mamba_output形状应为 (batch, seq_len, 4096)
         return self.wo(mamba_output)
@@ -283,16 +279,12 @@ class TransformerBlock(nn.Module):
 
     def forward(
         self,
-        x: torch.Tensor,
-        cache_params = None,  # 新增缓存参数
-        cache_position = None,
+        x: torch.Tensor
     ):
         h_norm = self.attention_norm(x)
         # 传递cache_params和cache_position给Mamba2
         attn_output = self.attention(
-            h_norm,
-            cache_params=cache_params,
-            cache_position=cache_position,
+            h_norm
         )
         h = x + attn_output
         # 前馈网络部分不变
