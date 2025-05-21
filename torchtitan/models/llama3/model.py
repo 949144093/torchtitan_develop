@@ -187,7 +187,7 @@ class Attention(nn.Module):
             num_heads=self.num_heads,
             head_dim=self.head_dim,
             hidden_size=model_args.dim,
-            n_groups=2,  # 分组参数设为2
+            n_groups=1,  # 分组参数设为2
             expand=1,    # 禁用扩展
             state_size=256,  # 256
             conv_kernel=4,
