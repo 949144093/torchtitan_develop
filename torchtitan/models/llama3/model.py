@@ -195,8 +195,8 @@ class Attention(nn.Module):
             rms_norm=True,
             norm_eps=model_args.norm_eps,
             layer_idx=layer_idx,
-            # chunk_size=model_args.max_seq_len,
-            chunk_size=64,
+            chunk_size=model_args.max_seq_len,
+            # chunk_size=64,
         )
 
         # 修正：确保在使用self.hidden_size之前已经初始化
