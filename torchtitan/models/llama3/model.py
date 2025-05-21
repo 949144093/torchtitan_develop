@@ -174,46 +174,48 @@ def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
 
 
 class Attention(nn.Module):
-    """使用Mamba2的注意力模块"""
-
     def __init__(self, model_args: TransformerModelArgs, layer_idx: int = None):
         super().__init__()
         self.model_args = model_args
-        head_dim = model_args.dim // model_args.n_heads  # 128 (4096/32)
+        # Llama3参数映射
+        self.num_heads = model_args.n_heads  # 32
+        self.head_dim = model_args.dim // self.num_heads  # 128
+        self.hidden_size = model_args.dim  # 4096
 
-        # 初始化Mamba2，映射Llama3参数
+        # 初始化Mamba2，显式传递正确维度
         self.mamba2 = Mamba2(
-            num_heads=model_args.n_heads,  # 头数与Llama3一致（32）
-            head_dim=head_dim,  # 头维度（128）
-            hidden_size=model_args.dim,  # 隐藏层大小（4096）
-            state_size=head_dim,  # 状态大小与头维度一致
+            num_heads=self.num_heads,
+            head_dim=self.head_dim,
+            hidden_size=self.hidden_size,
+            state_size=self.head_dim,  # 状态大小与头维度一致
             expand=2,  # Mamba2默认扩展比例
             n_groups=1,  # 禁止分组，避免头数拆分
-            conv_kernel=4,  # 默认卷积核大小
-            hidden_act="silu",  # 激活函数与Llama3一致
-            rms_norm=True,  # 使用RMSNorm
-            norm_eps=model_args.norm_eps,  # 归一化参数
-            layer_idx=layer_idx,  # 层索引（可选）
-            chunk_size=model_args.max_seq_len,  # 适配最大序列长度
+            conv_kernel=4,
+            hidden_act="silu",
+            rms_norm=True,
+            norm_eps=model_args.norm_eps,
+            layer_idx=layer_idx,
+            chunk_size=model_args.max_seq_len,
         )
 
-        # Mamba2输出线性层（与Llama3注意力输出一致）
-        self.wo = nn.Linear(model_args.dim, model_args.dim, bias=False)
-        # 层归一化（与Llama3结构一致）
-        self.norm = nn.RMSNorm(model_args.dim, eps=model_args.norm_eps)
+        self.wo = nn.Linear(self.hidden_size, self.hidden_size, bias=False)
+        self.norm = nn.RMSNorm(self.hidden_size, eps=model_args.norm_eps)
 
     def forward(
             self,
             x: torch.Tensor,
-            freqs_cis: torch.Tensor = None,  # 保留参数，但Mamba2不使用
+            freqs_cis: torch.Tensor = None,  # 忽略位置编码
+            cache_params = None,
+            cache_position = None,
     ):
-        # 应用层归一化
-        x_norm = self.norm(x)
-        # 调用Mamba2前向传播（忽略freqs_cis）
+        x_norm = self.norm(x)  # (batch, seq_len, 4096)
+        # 调用Mamba2，确保输入维度正确
         mamba_output = self.mamba2(
-            x_norm
-        )
-        # 线性变换输出
+            x_norm,
+            cache_params=cache_params,
+            cache_position=cache_position,
+            attention_mask=None,
+        )  # mamba_output形状应为 (batch, seq_len, 4096)
         return self.wo(mamba_output)
 
 
@@ -280,24 +282,22 @@ class TransformerBlock(nn.Module):
         self.ffn_norm = nn.RMSNorm(model_args.dim, eps=model_args.norm_eps)
 
     def forward(
-            self,
-            x: torch.Tensor,
-            freqs_cis: torch.Tensor = None,  # 传递但Mamba2不使用
+        self,
+        x: torch.Tensor,
+        cache_params = None,  # 新增缓存参数
+        cache_position = None,
     ):
-        # 残差连接：注意力部分
         h_norm = self.attention_norm(x)
-        # 调用Mamba2注意力（传递缓存参数）
+        # 传递cache_params和cache_position给Mamba2
         attn_output = self.attention(
             h_norm,
-            freqs_cis=freqs_cis
+            cache_params=cache_params,
+            cache_position=cache_position,
         )
-        h = x + attn_output  # 残差连接
-
-        # 残差连接：前馈网络部分
-        ffn_normed = self.ffn_norm(h)
-        ffn_output = self.feed_forward(ffn_normed)
-        out = h + ffn_output
-        return out
+        h = x + attn_output
+        # 前馈网络部分不变
+        ffn_output = self.feed_forward(self.ffn_norm(h))
+        return h + ffn_output
 
     def init_weights(self):
         for norm in (self.attention_norm, self.ffn_norm):
