@@ -279,12 +279,14 @@ class TransformerBlock(nn.Module):
 
     def forward(
         self,
-        x: torch.Tensor
+        x: torch.Tensor,
+        freqs_cis: torch.Tensor,
     ):
         h_norm = self.attention_norm(x)
         # 传递cache_params和cache_position给Mamba2
         attn_output = self.attention(
-            h_norm
+            h_norm,
+            freqs_cis
         )
         h = x + attn_output
         # 前馈网络部分不变
