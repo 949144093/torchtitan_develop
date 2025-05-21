@@ -177,14 +177,17 @@ class Attention(nn.Module):
     def __init__(self, model_args: TransformerModelArgs, layer_idx: int = None):
         super().__init__()
         self.model_args = model_args
-        num_heads = model_args.n_heads  # 32
-        head_dim = model_args.dim // num_heads  # 128
+
+        # 修正：显式初始化hidden_size属性
+        self.hidden_size = model_args.dim
+        self.num_heads = model_args.n_heads  # 32
+        self.head_dim = model_args.dim // self.num_heads  # 128
 
         # 显式设置n_groups=1，确保头数不被拆分
         self.mamba2 = Mamba2(
-            num_heads=num_heads,
-            head_dim=head_dim,
-            hidden_size=model_args.dim,
+            num_heads=self.num_heads,
+            head_dim=self.head_dim,
+            hidden_size=self.hidden_size,
             n_groups=1,  # 关键参数，避免头数拆分为16（如n_groups=2）
             # 其他参数保持默认或与Llama3一致
             expand=2,
@@ -196,6 +199,7 @@ class Attention(nn.Module):
             chunk_size=model_args.max_seq_len,
         )
 
+        # 修正：确保在使用self.hidden_size之前已经初始化
         self.wo = nn.Linear(self.hidden_size, self.hidden_size, bias=False)
         self.norm = nn.RMSNorm(self.hidden_size, eps=model_args.norm_eps)
 
