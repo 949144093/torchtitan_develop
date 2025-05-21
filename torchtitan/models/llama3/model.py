@@ -183,14 +183,13 @@ class Attention(nn.Module):
         self.num_heads = model_args.n_heads  # 32
         self.head_dim = model_args.dim // self.num_heads  # 128
 
-        # 显式设置n_groups=1，确保头数不被拆分
         self.mamba2 = Mamba2(
             num_heads=self.num_heads,
             head_dim=self.head_dim,
-            hidden_size=self.hidden_size,
-            n_groups=1,  # 关键参数，避免头数拆分为16（如n_groups=2）
-            # 其他参数保持默认或与Llama3一致
-            expand=2,
+            hidden_size=model_args.dim,
+            n_groups=2,  # 分组参数设为2
+            expand=1,    # 禁用扩展
+            state_size=256,  # 256
             conv_kernel=4,
             hidden_act="silu",
             rms_norm=True,
@@ -287,8 +286,7 @@ class TransformerBlock(nn.Module):
         h_norm = self.attention_norm(x)
         # 传递cache_params和cache_position给Mamba2
         attn_output = self.attention(
-            h_norm,
-            freqs_cis
+            h_norm
         )
         h = x + attn_output
         # 前馈网络部分不变
@@ -336,7 +334,7 @@ class Transformer(nn.Module, ModelProtocol):
         # a seed checkpoint rather than calling init_weights, we need freqs_cis to be
         # initialized by the checkpoint, or we need to add a separate initializer for
         # just the non-persistent buffers that is called after loading checkpoints.
-        self.register_buffer("freqs_cis", self._precompute_freqs_cis(), persistent=True)
+        # self.register_buffer("freqs_cis", self._precompute_freqs_cis(), persistent=True)
 
         self.layers = torch.nn.ModuleDict()
         for layer_id in range(model_args.n_layers):
@@ -360,9 +358,9 @@ class Transformer(nn.Module, ModelProtocol):
         ``init_weights``. We only call it in the constructor of this
         ``Transformer`` root module to avoid reinitializing tensors.
         """
-        buffer_device = buffer_device or self.freqs_cis.device
-        with torch.device(buffer_device):
-            self.freqs_cis = self._precompute_freqs_cis()
+        # buffer_device = buffer_device or self.freqs_cis.device
+        # with torch.device(buffer_device):
+        #     self.freqs_cis = self._precompute_freqs_cis()
         if self.tok_embeddings is not None:
             nn.init.normal_(self.tok_embeddings.weight)
         for layer in self.layers.values():
