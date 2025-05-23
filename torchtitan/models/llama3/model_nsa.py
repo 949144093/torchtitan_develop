@@ -186,10 +186,10 @@ class Attention(nn.Module):
         self.attention = NativeSparseAttention(
             hidden_size=model_args.dim,
             num_heads=model_args.n_heads,
-            num_kv_heads=4,
+            num_kv_heads=model_args.n_kv_heads,
             head_dim=model_args.dim // model_args.n_heads,
             qkv_bias=False,
-            block_size=16,
+            block_size=8,
             block_counts=16,
             window_size=512,
             rope_theta=10000.,
