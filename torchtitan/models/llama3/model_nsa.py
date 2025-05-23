@@ -189,7 +189,7 @@ class Attention(nn.Module):
             num_kv_heads=4,
             head_dim=model_args.dim // model_args.n_heads,
             qkv_bias=False,
-            block_size=8,
+            block_size=16,
             block_counts=16,
             window_size=512,
             rope_theta=10000.,
