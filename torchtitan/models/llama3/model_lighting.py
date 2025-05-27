@@ -253,18 +253,18 @@ class Attention(nn.Module):
         keys = repeat_kv(xk, self.n_rep)  # (bs, seqlen, n_local_heads, head_dim)
         values = repeat_kv(xv, self.n_rep)  # (bs, seqlen, n_local_heads, head_dim)
 
-        # xq = xq.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
-        # xk = keys.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
-        # xv = values.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
+        xq = xq.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
+        xk = keys.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
+        xv = values.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
 
         # output = self.sdpa(xq, xk, xv)
         s = _build_slope_tensor(self.n_heads).to(xq.device).to(torch.float32)
 
         output = lightning_attn_func(xq, xk, xv, s)
 
-        # output = output.transpose(
-        #     1, 2
-        # ).contiguous()  # (bs, seqlen, n_local_heads, head_dim)
+        output = output.transpose(
+            1, 2
+        ).contiguous()  # (bs, seqlen, n_local_heads, head_dim)
         output = output.view(bs, seqlen, -1)
         return self.wo(output)
 
